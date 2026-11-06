@@ -73,6 +73,7 @@ declare -A PLATFORM_AUTHENTICATED_USER_ENDPOINT
 declare -A PLATFORM_AUTHENTICATED_USER_KEY
 declare -A PLATFORM_ACCEPT_HEADER
 declare -A PLATFORM_REPO_DELETE_ENDPOINT
+declare -A PLATFORM_REPO_DELETE_METHOD
 # declare -A PLATFORM_AUTH_HEADER_OVERRIDES
 AVAILABLE_PLATFORMS=()
 DRY_RUN_ACTIONS=()
@@ -279,7 +280,7 @@ test_platform_config() {
     echo -e "\nToken status:"
     for platform in "${AVAILABLE_PLATFORMS[@]}"; do
         local token_var="${PLATFORM_TOKEN_VAR[$platform]}"
-        local token_value="${!token_var}"
+        local token_value="${!token_var:-}"
         if [[ -n "$token_value" ]]; then
             echo -e "  ${platform}: ${GREEN}✓ Token set${NC}"
         else
@@ -538,7 +539,7 @@ platform_api_call() {
     # Get platform configuration
     local api_base="${PLATFORM_API_BASE[$platform]}"
     local token_var_name="${PLATFORM_TOKEN_VAR[$platform]}"
-    local token_value="${!token_var_name}"
+    local token_value="${!token_var_name:-}"
     local auth_template="${PLATFORM_AUTH_HEADER[$platform]:-Bearer {token}}"
     local auth_header_name="${PLATFORM_AUTH_HEADER_NAME[$platform]:-Authorization}"
 
@@ -3124,7 +3125,7 @@ main() {
     echo -e "${YELLOW}Status:${NC}"   # lastly done, needed to be reviewed.
     for platform in "${AVAILABLE_PLATFORMS[@]}"; do
         token_var="${PLATFORM_TOKEN_VAR[$platform]}"
-        if [[ -n "${!token_var}" ]]; then
+        if [[ -n "${!token_var:-}" ]]; then
             echo -e "  ${GREEN}●${NC} $platform (API: ✓)"
         else
             echo -e "  ${RED}○${NC} $platform (API: ✗)"
