@@ -639,12 +639,15 @@ fi
 
 ### **9.10 `_delete_local_copy()`**
 
-**Deletes directory only with safety confirmation**.
+**Deletes local files only; bound remotes are never touched**.
 
 **Flow**:
-1. Select project from `LOCAL_ROOT`
-2. Confirm deletion
-3. `rm -rf` with `execute_dangerous`
+1. Select a project from `PROJECT_ROOT` (local-only and bound projects both listed)
+2. Warn based on state:
+   - no remotes → this is the only copy, deletion is permanent
+   - has remotes → remotes stay, project can be re-cloned, `REMOTE_STATE.yml` goes with the folder
+3. Confirm deletion
+4. `rm -rf` with `execute_dangerous` (skipped in dry-run)
 
 
 ### **9.11 `_delete_both()`**
@@ -661,8 +664,9 @@ read -rp "Type 'DELETE': " confirm_delete
 ```
 
 **Delete sequence**:
-1. **API deletion**: `DELETE` request to platform API
-2. **Local deletion**: `rm -rf`
+1. **Selection**: lists `REMOTE_ROOT` projects, excluding `Multi-server` (multi-platform projects must be removed manually for now)
+2. **API deletion**: `DELETE` request for every remote, each on its platform (detected from the remote URL)
+3. **Local deletion**: `rm -rf` (only if all API deletions succeeded)
 
 Note: This function relies on _cleanup_failed_creation() for atomic operations during repository creation failures.
 

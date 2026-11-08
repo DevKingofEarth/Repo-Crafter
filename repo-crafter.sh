@@ -31,8 +31,9 @@ set -euo pipefail
 FORBIDDEN_DIRS=("/etc" "/root" "/bin" "/sbin" "/usr")
 
 # Path variables
-LOCAL_ROOT="$HOME/Projects/Local_Projects"
-REMOTE_ROOT="$HOME/Projects/Remote_Projects"
+PROJECT_ROOT="$HOME/Projects"
+LOCAL_ROOT="$PROJECT_ROOT/Local_Projects"
+REMOTE_ROOT="$PROJECT_ROOT/Remote_Projects"
 
 # Colors for output
 RED='\033[0;31m'
@@ -389,14 +390,25 @@ validate_project_name() {
     return 0
 }
 
+# Sanitize a URL-derived repo name into one safe path component
+# Dots become underscores so the result also passes validate_project_name
+safe_dir_name() {
+    local n="${1##*/}"
+    n="${n%.git}"
+    n="${n//[^A-Za-z0-9_-]/_}"
+    n="${n#-}"
+    [[ -z "$n" ]] && n="repo"
+    printf '%s' "${n:0:100}"
+}
+
 # Check for existing Git repos with the same name in other directories
 warn_duplicate_repo_name() {
     local project_name="$1"
     local parent_dir="$2"
     local existing_repos=()
 
-    # Define where to search for existing projects (customize this list!)
-    local search_dirs=("$HOME/Projects" "$HOME/Work" "$HOME/Development" "$HOME/git")
+    # Search the managed root only
+    local search_dirs=("$PROJECT_ROOT")
 
     # Get the absolute path of the parent directory for accurate comparison
     local abs_parent_dir
@@ -1279,7 +1291,11 @@ _clone_existing_remote() {
   # --- PART 2: PARSE URL & DETECT PLATFORM (Your existing code) ---
   local parsed_path=$(parse_git_url "$first_url")
   [[ -z "$parsed_path" ]] && { echo -e "${RED}Invalid URL format${NC}"; return 1; }
-  local repo_name=$(basename "$parsed_path")
+  local repo_name
+  repo_name=$(safe_dir_name "$parsed_path")
+  if [[ "$repo_name" != "$(basename "$parsed_path")" ]]; then
+      echo -e "${YELLOW}Using directory name: $repo_name${NC}" >&2
+  fi
 
   local host
   host=$(extract_host_from_url "$first_url")
@@ -1331,8 +1347,8 @@ _clone_existing_remote() {
 _create_local_only() {
   local project_name dest_dir
 
-  read -rp "Project name: " project_name
-  [[ -z "$project_name" ]] && return
+  project_name=$(_prompt_project_name) || return
+  [[ -n "$project_name" ]] || return
 
   dest_dir="$LOCAL_ROOT/$project_name"
   [[ -d "$dest_dir" ]] && { echo -e "${RED}Exists.${NC}"; return; }
@@ -1362,19 +1378,15 @@ _create_local_only() {
 convert_single_to_multi_platform() {
   echo -e "\n${BLUE}=== CONVERT SINGLE-PLATFORM TO MULTI-PLATFORM ===${NC}"
 
-  # 1. Select single-platform project
-  local single_projects=()
-  for platform in "${AVAILABLE_PLATFORMS[@]}"; do
-    local platform_dir="$REMOTE_ROOT/${PLATFORM_WORK_DIR[$platform]}"
-    while IFS= read -r git_dir; do
-      single_projects+=("$(dirname "$git_dir")")
-    done < <(find "$platform_dir" -name ".git" -type d 2>/dev/null)
-  done
-
-  # Let user select a project
+  # Let user select a single-platform project (Multi-server excluded)
   local source_dir
-  source_dir=$(_select_project_from_dir "$REMOTE_ROOT" "Single-platform projects available:")
-  [[ -z "$source_dir" ]] && return
+  source_dir=$(_select_project_from_dir "$REMOTE_ROOT" "Single-platform projects available:" "$REMOTE_ROOT/Multi-server") || return 0
+  [[ -z "$source_dir" ]] && return 0
+  # Backstop: source and destination would be the same directory
+  if [[ "$source_dir" == "$REMOTE_ROOT/Multi-server/"* ]]; then
+    echo -e "${YELLOW}Already multi-platform (in Multi-server/). Nothing to convert.${NC}"
+    return 0
+  fi
 
   local project_name=$(basename "$source_dir")
   local current_platform=""
@@ -1421,26 +1433,36 @@ convert_single_to_multi_platform() {
 
   confirm_action "Proceed with conversion?" || return
 
+  # Ensure the managed parent exists (git clone creates it; mv does not)
+  execute_safe "Create Multi-server directory" mkdir -p "$(dirname "$dest_dir")" || return 1
+
   # 6. Move to Multi-server
   if [[ -d "$dest_dir" ]]; then
     echo -e "${YELLOW}Directory '$dest_dir' already exists.${NC}"
     local overwrite_choice
     read -rp "Do you want to overwrite it? (y/N): " overwrite_choice
     if [[ "${overwrite_choice,,}" =~ ^y$ ]]; then
-      rm -rf "$dest_dir" || {
-        echo -e "${RED}❌ Failed to remove existing directory '$dest_dir'.${NC}"
+      if ! execute_dangerous "Remove existing directory" rm -rf "$dest_dir"; then
+        echo -e "${YELLOW}Aborted.${NC}"
         return 1
-      }
+      fi
       echo -e "${GREEN}Removed existing directory '$dest_dir'.${NC}"
     else
       echo -e "${YELLOW}Aborting conversion.${NC}"
       return 1
     fi
   fi
-  mv "$source_dir" "$dest_dir" || {
+  if ! execute_dangerous "Move project to Multi-server" mv "$source_dir" "$dest_dir"; then
     echo -e "${RED}❌ Failed to move '$source_dir' to '$dest_dir'.${NC}"
     return 1
-  }
+  fi
+
+  # In dry-run the move was skipped; stop here so nothing else runs
+  if [[ "$DRY_RUN" == "true" ]]; then
+    preview_and_abort_if_dry
+    return 0
+  fi
+
   cd "$dest_dir" || {
     echo -e "${RED}❌ Failed to change directory to '$dest_dir'.${NC}"
     return 1
@@ -1563,7 +1585,6 @@ convert_local_to_remote_workflow() {
   # === VARIABLES DECLARATION ===
   local dest_dir=""
   local platform_array=()
-  local remote_url=""
   local visibility=""
   local user_name=$(git config --global user.name)
   local continue_workflow=true  # Control flag for workflow continuation
@@ -1590,9 +1611,6 @@ convert_local_to_remote_workflow() {
     else
         dest_dir="$REMOTE_ROOT/Multi-server/$project_name"
     fi
-
-    # Create destination directory before attempting git operations
-    execute_safe "Create destination directory" mkdir -p "$dest_dir"
 
     # Ask for visibility
     echo -e "\n${YELLOW}Repository visibility for new repositories?${NC}"
@@ -1629,6 +1647,9 @@ convert_local_to_remote_workflow() {
       return 1
     fi
 
+    # Create destination directory only after confirmation
+    execute_safe "Create destination directory" mkdir -p "$dest_dir"
+
   # === OPTION 2: CONNECT TO EXISTING REPOSITORY ===
   elif [[ "$bind_choice" == "2" ]]; then
     echo -e "\n${YELLOW}Enter repository URLs (one per line, empty line to finish):${NC}"
@@ -1645,8 +1666,6 @@ convert_local_to_remote_workflow() {
 
     # Parse first URL for cloning
     local first_url="${urls[0]}"
-    local parsed_path=$(parse_git_url "$first_url")
-    local repo_name=$(basename "$parsed_path")
     # === CLONE USING THE NEW UNIVERSAL FUNCTION ===
     echo -e "\n${BLUE}Cloning primary repository...${NC}"
 
@@ -1663,9 +1682,6 @@ convert_local_to_remote_workflow() {
 
     echo -e "${GREEN}✅ Cloned to $cloned_dir${NC}"
 
-    # remote_url assignment
-    remote_url="$first_url"
-
     # CRITICAL: The cloned directory path is now in $cloned_dir.
     # Set $dest_dir to this value for any later logic that expects it.
     dest_dir="$cloned_dir"
@@ -1674,8 +1690,6 @@ convert_local_to_remote_workflow() {
     cd "$dest_dir" || { echo -e "${RED}❌ Cannot enter cloned directory.${NC}"; return 1; }
 
         # === MERGE LOCAL FILES ===
-        cd "$dest_dir" || return
-
         echo -e "\n${BLUE}Merging your local files...${NC}"
         echo -e "${YELLOW}This will copy files from:${NC}"
         echo -e "  Source: $source_dir"
@@ -1690,9 +1704,15 @@ convert_local_to_remote_workflow() {
         # COPY files, not move
         echo -e "${BLUE}Copying files...${NC}"
         if command -v rsync &>/dev/null; then
-          rsync -av --exclude='.git' "$source_dir/" . 2>/dev/null
+          rsync -av --exclude='.git' "$source_dir/" . || {
+            echo -e "${RED}❌ Copy failed; original kept.${NC}"
+            return 1
+          }
         else
-          (cd "$source_dir" && find . -name '.git' -prune -o -print0 | cpio -pdm0 .) 2>/dev/null
+          (cd "$source_dir" && find . -name '.git' -prune -o -print0 | cpio -pdm0 .) || {
+            echo -e "${RED}❌ Copy failed; original kept.${NC}"
+            return 1
+          }
         fi
 
         # === GIT STATUS & COMMIT ===
@@ -1719,7 +1739,6 @@ convert_local_to_remote_workflow() {
             echo -e "\n${BLUE}Adding additional remotes...${NC}"
             for ((i=1; i<${#urls[@]}; i++)); do
                 local url="${urls[$i]}"
-                local parsed=$(parse_git_url "$url")
                 local remote_name="remote$((i+1))"
 
                 git remote add "$remote_name" "$url" 2>/dev/null && \
@@ -1737,12 +1756,12 @@ convert_local_to_remote_workflow() {
 
         case $cleanup_choice in
             2)
-                rm -rf "$source_dir"
+                execute_dangerous "Remove original project" rm -rf "$source_dir" || return 1
                 echo -e "${GREEN}✓ Original project removed${NC}"
                 ;;
             3)
                 local backup_dir="$LOCAL_ROOT/_backup_$project_name"
-                mv "$source_dir" "$backup_dir"
+                execute_dangerous "Move original to backup" mv "$source_dir" "$backup_dir" || return 1
                 echo -e "${GREEN}✓ Original moved to: $backup_dir${NC}"
                 ;;
             *)
@@ -1870,32 +1889,6 @@ convert_local_to_remote_workflow() {
       create_multi_platform_manifest "$dest_dir" "$project_name" platform_urls "convert_local_to_remote"
     fi
 
-  elif [[ "$bind_choice" == "2" ]]; then
-    # CONNECT TO EXISTING REPOSITORY
-    echo -e "\n${BLUE}Connecting to existing repository...${NC}"
-
-    local platform="${platform_array[0]}"
-
-    # Add/update remote
-    if handle_existing_remote "$platform" "$remote_url"; then
-      if ! git remote get-url "$platform" &>/dev/null; then
-        execute_dangerous "Add remote" git remote add "$platform" "$remote_url"
-      fi
-      echo -e "${GREEN}✓ Connected to $platform${NC}"
-
-      # Branch management
-      local current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
-
-        # NEW: Call unified synchronization function
-      if sync_with_remote "$platform" "$remote_url"; then
-        echo -e "${GREEN}✓ Synchronization complete${NC}"
-      else
-        echo -e "${YELLOW}⚠️  Synchronization incomplete or cancelled${NC}"
-        echo -e "  You may need to manually resolve conflicts."
-      fi
-    else
-      echo -e "${RED}✗ Failed to add remote${NC}"
-    fi
   fi
 
   # === FINAL SUCCESS MESSAGE ===
@@ -1903,11 +1896,6 @@ convert_local_to_remote_workflow() {
 
   echo -e "\n${GREEN}✅ Project successfully bound!${NC}"
   echo -e "Location: $dest_dir"
-
-  if [[ "$bind_choice" == "2" ]]; then
-    echo -e "${YELLOW}⚠️  Note: Connected to existing repository.${NC}"
-    echo "Run 'git fetch --all' and 'git status' to check sync status."
-  fi
 
   # Only pause in dry-run mode
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -1921,17 +1909,25 @@ convert_local_to_remote_workflow() {
 convert_remote_to_local_workflow() {
   echo -e "\n${BLUE}=== UNBIND REMOTE PROJECT TO LOCAL ===${NC}"
 
-  # === LIST BOUND PROJECTS ===
-  local projects=()
-  while IFS= read -r git_dir; do
-    projects+=("$(dirname "$git_dir")")
-  done < <(find "$REMOTE_ROOT" -name ".git" -type d)
-
+  # === SELECT A BOUND PROJECT ===
   local source_dir
   source_dir=$(_select_project_from_dir "$REMOTE_ROOT" "Projects available to bind:") || return
   local project_name=$(basename "$source_dir")
   echo -e "${GREEN}Selected: $project_name${NC}"
   local dest_dir="$LOCAL_ROOT/$project_name"
+
+  # Resolve the destination before any destructive step
+  if [[ -d "$dest_dir" ]]; then
+    echo -e "${RED}Destination exists: $dest_dir${NC}"
+    if ! confirm_action "Destination exists. Overwrite?"; then
+      echo -e "${YELLOW}Cancelled. Nothing was changed.${NC}"
+      return 0
+    fi
+    if ! execute_dangerous "Remove existing destination" rm -rf "$dest_dir"; then
+      echo -e "${RED}❌ Failed to remove existing destination.${NC}"
+      return 1
+    fi
+  fi
 
   # 2. Confirm unbinding
   echo -e "${YELLOW}This will:${NC}"
@@ -1940,7 +1936,7 @@ convert_remote_to_local_workflow() {
   echo "  - Delete REMOTE_STATE.yml if exists"
   confirm_action "This will remove ALL git remotes and move project to Local_Projects/" || return
 
-  cd "$source_dir"
+  cd "$source_dir" || { echo -e "${RED}❌ Cannot enter '$source_dir'.${NC}"; return 1; }
 
   echo -e "\n${BLUE}=== Checking Repository Status ===${NC}"
   if git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null; then
@@ -1951,14 +1947,16 @@ convert_remote_to_local_workflow() {
 
   # 3. Remove remotes with error handling
   local removed_count=0
-  while read -r remote; do
+  local remotes=()
+  mapfile -t remotes < <(git remote 2>/dev/null)
+  for remote in "${remotes[@]}"; do
       if execute_dangerous "Remove remote $remote" git remote remove "$remote"; then
           echo -e "${GREEN}✓ Removed remote: $remote${NC}"
-          ((removed_count++))
+          removed_count=$((removed_count + 1))
       else
           echo -e "${YELLOW}⚠️  Skipped removing remote: $remote${NC}"
       fi
-  done < <(git remote 2>/dev/null) || true
+  done
 
   if [[ $removed_count -eq 0 ]]; then
       echo -e "${YELLOW}⚠️  No remotes were removed.${NC}"
@@ -1968,14 +1966,9 @@ convert_remote_to_local_workflow() {
   # 4. Delete manifest
   [[ -f "REMOTE_STATE.yml" ]] && execute_safe rm -f "REMOTE_STATE.yml"
 
-  cd - >/dev/null
+  cd - >/dev/null || { echo -e "${RED}❌ Cannot return to previous directory.${NC}"; return 1; }
 
   # 5. Move directory
-  if [[ -d "$dest_dir" ]]; then
-    echo -e "${RED}Destination exists: $dest_dir${NC}"
-    confirm_action "Destination exists. Overwrite?" || return
-  fi
-
   # CREATE PARENT DIRECTORY AND MOVE
   local parent_dir=$(dirname "$dest_dir")
   execute_safe "Create directory structure" mkdir -p "$parent_dir"
@@ -2034,7 +2027,7 @@ manage_project_workflow() {
   echo -e "\n${RED}=== DELETE PROJECT (SAFE) ===${NC}"
 
   echo "Delete what?"
-  echo "  1) Delete local copy (keeps remote repo)"
+  echo "  1) Delete local files (remote repo kept if bound)"
   echo "  2) Unbind from remote (keeps local, moves to Local_Projects/)"
   echo "  3) Delete BOTH (TYPE PROJECT NAME TO CONFIRM)"
   echo "  x) Cancel"
@@ -2049,29 +2042,53 @@ manage_project_workflow() {
   esac
 }
 
-# Delete local copy only
+# Delete local files only (bound remotes are kept)
 _delete_local_copy() {
   local source_dir project_name
 
-  # Use helper for listing, bounds checking, and selection
-  source_dir=$(_select_project_from_dir "$LOCAL_ROOT" "Select project to DELETE LOCALLY:") || return
+  # Bound and local-only projects are both listed; only local files are removed
+  source_dir=$(_select_project_from_dir "$PROJECT_ROOT" "Select project to DELETE LOCALLY:") || return
   [[ -z "$source_dir" ]] && return
 
   project_name=$(basename "$source_dir")
-  confirm_action "Are you sure you want to DELETE $project_name?" || return
+
+  # Warn differently for bound and local-only projects
+  local remotes=()
+  mapfile -t remotes < <(git -C "$source_dir" remote 2>/dev/null)
+  if [[ ${#remotes[@]} -eq 0 ]]; then
+    echo -e "\n${RED}⚠️  This project has NO remote repository.${NC}"
+    echo -e "${YELLOW}Deleting it removes the ONLY copy — this cannot be undone.${NC}"
+  else
+    echo -e "\n${YELLOW}This deletes the local files only.${NC}"
+    echo -e "  • Remote repositories stay untouched: ${remotes[*]}"
+    echo -e "  • You can clone it again later"
+    echo -e "  • ${CYAN}REMOTE_STATE.yml${NC} (if present) is deleted with the folder"
+  fi
+
+  confirm_action "Are you sure you want to DELETE the local files of $project_name?" || return
 
   execute_dangerous "Delete local directory" rm -rf "$source_dir" && echo -e "${GREEN}✅ Deleted local copy${NC}" || echo -e "${RED}❌ Failed${NC}"
   sleep 5
   preview_and_abort_if_dry
 }
 
+# Run a platform API delete without printing the raw response body
+_delete_remote_quiet() {
+  platform_api_call "$@" >/dev/null
+}
+
 # Helper: Delete both local and remote
 _delete_both() {
-  local source_dir project_name platform user_name
+  local source_dir project_name
 
   # Use helper for listing, bounds checking, and selection
-  source_dir=$(_select_project_from_dir "$REMOTE_ROOT" "Select project to DELETE EVERYTHING:") || return
+  # Multi-server projects hold several remotes; exclude them for now
+  source_dir=$(_select_project_from_dir "$REMOTE_ROOT" "Select project to DELETE EVERYTHING:" "$REMOTE_ROOT/Multi-server") || return
   [[ -z "$source_dir" ]] && return
+  if [[ "$source_dir" == "$REMOTE_ROOT/Multi-server/"* ]]; then
+    echo -e "${YELLOW}Multi-server projects are not handled here. Remove them manually for now.${NC}"
+    return 0
+  fi
 
   project_name=$(basename "$source_dir")
 
@@ -2098,29 +2115,44 @@ _delete_both() {
     return
   fi
 
-  cd "$source_dir"
-  platform=$(git remote | head -1)
-  user_name=$(git config --global user.name)
+  cd "$source_dir" || { echo -e "${RED}❌ Cannot enter '$source_dir'.${NC}"; return 1; }
 
-  # Delete remote via API
-  echo -e "\n${YELLOW}Deleting remote repository...${NC}"
-
-  # Get owner from API (more reliable than git config)
-  local owner
-  owner=$(git remote get-url "$platform" 2>/dev/null | sed -E 's/.*[:/]([^:]*\/[^.]*)\.git/\1/' | cut -d/ -f1)
-
-  # Build delete endpoint from config
-  local delete_endpoint="${PLATFORM_REPO_DELETE_ENDPOINT[$platform]}"
-  delete_endpoint="${delete_endpoint//\{owner\}/$owner}"
-  delete_endpoint="${delete_endpoint//\{repo\}/$project_name}"
-
-  if execute_dangerous "Delete remote repository" platform_api_call "$platform" "$delete_endpoint" "DELETE" >/dev/null; then
-    echo -e "${GREEN}✅ Remote repository deleted${NC}"
-  else
-    echo -e "${RED}❌ Failed to delete remote repository${NC}"
-    echo -e "${YELLOW}Local files preserved. Operation cancelled.${NC}"
+  # Delete every remote repository, each on its own platform
+  echo -e "\n${YELLOW}Deleting remote repositories...${NC}"
+  local remotes=()
+  mapfile -t remotes < <(git remote 2>/dev/null)
+  if [[ ${#remotes[@]} -eq 0 ]]; then
+    echo -e "${YELLOW}⚠️  No remotes found. Local files preserved.${NC}"
     return 1
   fi
+
+  local remote url platform owner delete_endpoint
+  for remote in "${remotes[@]}"; do
+    url=$(git remote get-url "$remote" 2>/dev/null) || continue
+    if ! platform=$(detect_platform_from_url "$url"); then
+      echo -e "${RED}❌ Unknown platform for '$remote' ($url). Local files preserved.${NC}"
+      return 1
+    fi
+    if ! owner=$(get_owner_from_ssh_url "$url"); then
+      echo -e "${RED}❌ Cannot read owner from '$url'. Local files preserved.${NC}"
+      return 1
+    fi
+    delete_endpoint="${PLATFORM_REPO_DELETE_ENDPOINT[$platform]:-}"
+    if [[ -z "$delete_endpoint" ]]; then
+      echo -e "${RED}❌ No delete endpoint configured for '$platform'. Local files preserved.${NC}"
+      return 1
+    fi
+    delete_endpoint="${delete_endpoint//\{owner\}/$owner}"
+    delete_endpoint="${delete_endpoint//\{repo\}/$project_name}"
+
+    if execute_dangerous "Delete remote repository ($platform)" _delete_remote_quiet "$platform" "$delete_endpoint" "${PLATFORM_REPO_DELETE_METHOD[$platform]:-DELETE}"; then
+      echo -e "${GREEN}✅ Remote repository deleted ($platform)${NC}"
+    else
+      echo -e "${RED}❌ Failed to delete remote repository ($platform)${NC}"
+      echo -e "${YELLOW}Local files preserved. Operation cancelled.${NC}"
+      return 1
+    fi
+  done
 
   # Delete local - use execute_dangerous for confirmation
   cd "$HOME"
@@ -2648,12 +2680,8 @@ preview_and_abort_if_dry() {
 gitignore_maker_interactive() {
   echo -e "\n${BLUE}=== Gitignore Manager ===${NC}"
   local dir
-  read -rp "Project directory: " dir
-  dir="${dir/#\~/$HOME}"
-  if [[ ! -d "$dir" ]]; then
-    echo -e "${RED}Directory not found${NC}"
-    return 1
-  fi
+  dir=$(_select_project_from_dir "$PROJECT_ROOT" "Select project for .gitignore:") || return 1
+  [[ -n "$dir" ]] || return 1
   gitignore_maker "$dir" "standalone"
 }
 
@@ -2756,10 +2784,12 @@ EOF
 _prompt_project_name() {
   local name
   while true; do
-    read -rp "Project name: " name
+    read -rp "Project name: " name || return 1
     [[ -z "$name" ]] && continue
-    [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] && { echo "$name"; return 0; }
-    echo -e "${RED}Invalid name (use a-z, 0-9, -, _)${NC}"
+    if validate_project_name "$name" "project name"; then
+      echo "$name"
+      return 0
+    fi
   done
 }
 
@@ -2790,6 +2820,7 @@ _prompt_visibility() {
 _select_project_from_dir() {
     local root_dir="$1"
     local prompt="$2"
+    local exclude_dir="${3:-}"
     local projects=()
 
     # Find all project directories
@@ -2800,9 +2831,12 @@ _select_project_from_dir() {
         done < <(find "$root_dir" -maxdepth 1 -mindepth 1 -type d ! -name ".*" 2>/dev/null | sort)
     else
         # Remote projects: find directories with .git
+        local find_args=("$root_dir")
+        [[ -n "$exclude_dir" ]] && find_args+=(-path "$exclude_dir" -prune -o)
+        find_args+=(-type d -name ".git" -print)
         while IFS= read -r git_dir; do
             projects+=("$(dirname "$git_dir")")
-        done < <(find "$root_dir" -type d -name ".git" 2>/dev/null)
+        done < <(find "${find_args[@]}" 2>/dev/null)
     fi
 
     [[ ${#projects[@]} -eq 0 ]] && {
