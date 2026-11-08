@@ -126,6 +126,7 @@ AVAILABLE_PLATFORMS=()
 - Uses `declare -gA "$array_name"` to create global associative arrays at runtime
 - Config parsing uses regex patterns to match `key = value` syntax
 - Filters platforms where `enabled=true` AND `api_base` is set AND `token_var` is set
+- `work_dir` must be a single directory component (no `/`, not `.` or `..`); an invalid value aborts config loading. If omitted, it defaults to `repo_domain`, then to the platform name
 
 **Extended Support**: Config parsing now automatically handles `auth_header_name`, `auth_query_param`, `accept_header`, and `repo_delete_endpoint` keys when present in platform configuration.
 
@@ -186,9 +187,9 @@ AVAILABLE_PLATFORMS=()
 ## **7. CORE VALIDATION FUNCTIONS**
 
 ### **7.1 `check_local_exists(path)`**
-- **One-liner**: `[[ -d "$1/.git" ]]`
+- **Implementation**: `git -C "$dir" rev-parse --git-dir >/dev/null 2>&1` (also true for worktrees and submodules)
 - **Purpose**: Check if directory is a Git repository
-- **Used by**: Bind/unbind workflows to decide whether to `git init`
+- **Used by**: Bind workflow to skip fetch/diff checks for a folder that is not a repo yet; the folder is initialized during binding
 
 ### **7.2 `check_ssh_auth(host, platform_name)`**
  **7.2 `check_ssh_auth(host, platform_name)`**
@@ -352,26 +353,27 @@ Branch synchronization control flow.
 
 **Branch detection flow:**
 ```bash
-current_branch=$(git symbolic-ref --short HEAD 2>/dev/null || 
-                 git rev-parse --short HEAD 2>/dev/null || 
-                 echo "main")
-# Handle detached HEAD
-if [[ "$current_branch" =~ ^[0-9a-f]{7,}$ ]] || [[ "$current_branch" == "HEAD" ]]; then
-    default_branch=$(git ls-remote --symref "$remote_url" HEAD 2>/dev/null | 
-                    awk -F'[/]' '/symref/ {print $3}' | head -1)
-    [[ -z "$default_branch" ]] && default_branch="main"
-    current_branch="$default_branch"
-fi
+current_branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+[[ -z "$current_branch" ]] && { echo "Detached HEAD"; return 1; }
 ```
 
-**Synchronization states:**
+**Branch inventory:**
+- Local branches from `refs/heads/*`
+- Remote branches from `refs/remotes/<platform>/*` via `%(refname:lstrip=3)`
+- Classified as matched, local-only, remote-only
+- A different remote default is reported as a notice, never used to rename
+
+**Synchronization states (current branch only):**
+- **Missing on remote**: offer `git push -u "$platform" "$current_branch"`
 - **Identical branches** (`ahead=0` and `behind=0`): Offer push confirmation
 - **Local ahead only** (`behind=0` and `ahead>0`): Simple push workflow
-- **Remote ahead** (`behind>0`): Three options:
+- **Remote ahead** (`behind>0`): Four options:
   1. Rebase: `git rebase "$platform/$remote_branch" --quiet`
   2. Merge: `git merge "$platform/$remote_branch" --no-edit --quiet`
-  3. Skip: Force push with warning
-- **Branch mismatch handling**: `git branch -m "$current_branch" "$remote_branch"`
+  3. Skip: Push anyway, creating divergent branches
+  4. Cancel: restore the stash and return non-zero
+- **Other local-only branches**: optional bulk push, excluding the current branch
+- **Remote-only branches**: listed with a `git switch -c` suggestion; never merged automatically
 
 **Stash management:**
 - Pre-synchronization: `git stash push -m "repo-crafter: pre-sync" --quiet`
@@ -425,7 +427,7 @@ bind_choice determines execution path:
     dest_dir="$REMOTE_ROOT/Multi-server/$project_name"
   ```
 - Repository creation loop: `create_remote_repo "$platform" "$project_name" "$visibility" "$user_name"`
-- Automatic synchronization: `sync_with_remote "$platform" "$remote_url"`
+- Single-platform synchronization: `sync_with_remote` offered after the loop (multi-platform deferred)
 
 **Option 2 (EXISTING repository):**
 - URL parsing: `parse_git_url "$first_url"`
@@ -437,14 +439,13 @@ bind_choice determines execution path:
   ```
 - Directory cloning: `git clone "$first_url" "$dest_dir"`
 - File merging: `cp -r "$source_dir/." .`
-- Divergence handling: `sync_with_remote` called after cloning
+- Synchronization: `sync_with_remote origin "$first_url"` offered after binding
 
-**Conflict Detection**: When binding to an existing remote, the workflow:
-1. Fetches remote state
-2. Compares commit counts (ahead/behind)
-3. Warns if remote has new commits ("Remote has X new commit(s)")
-4. Warns if local has unpushed commits ("You have X local commit(s) not pushed")
-5. Offers rebase/merge/skip options
+**Repository status check (before binding):**
+1. Skips the checks when the folder is not a git repository yet (it is initialized during binding)
+2. Reports "No remotes configured" when the repo has none
+3. Fetches and compares ahead/behind only when the current branch has an upstream; otherwise reports that remote state was not compared
+4. Warns about uncommitted changes
 
 **Edge case handling:**
 - Detached HEAD state detection in `current_branch` logic
@@ -465,7 +466,7 @@ behind=$(git rev-list --count "$current_branch..$platform/$remote_branch" 2>/dev
 |-------------|--------------|--------|
 | 0 | 0 | Push option |
 | >0 | 0 | Simple push |
-| Any | >0 | Three integration options (rebase/merge/skip) |
+| Any | >0 | Integration options (rebase/merge/push-anyway/cancel) |
 
 **Stash management protocol:**
 ```bash
@@ -483,10 +484,14 @@ fi
 [[ "$stashed" == "true" ]] && git stash pop --quiet >/dev/null
 ```
 
-**Branch mismatch resolution:**
-- Remote branch detection: `git ls-remote --symref "$remote_url" HEAD`
-- Local branch rename: `git branch -m "$current_branch" "$remote_branch"`
-- Detached HEAD fallback: `default_branch=$(git config --get init.defaultBranch)`
+**Branch name mismatches:**
+- Remote default detection: `git ls-remote --symref "$remote_url" HEAD`, parsed from the `ref:` line
+- A different remote default is only reported; branches are never renamed
+- Detached HEAD is refused instead of guessing a branch
+
+**Wiring:**
+- Called after a successful bind: connect-existing (`origin`) and single-platform create
+- Runs in a subshell; cancel or skip returns to the menu
 
 #### **9.3 `manage_project_workflow()`**
 Destructive operation safety protocol.
@@ -752,7 +757,7 @@ Direct gitignore management with multiple pattern sources.
   1. `Commit to repository` (default) - Stages and commits .gitignore
   2. `Keep local only` - Moves patterns to `.git/info/exclude` (never committed/pushed)
 
-- **Template file generation**: Always creates `.gitignore.template` with:
+- **Template file generation**: Creates `.gitignore.template` in commit mode only, with:
   - Reference patterns for common categories
   - Usage instructions and best practices
   - Security notes about sensitive files

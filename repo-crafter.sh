@@ -98,6 +98,7 @@ api_base = https://api.github.com
 ssh_host = github.com
 repo_domain = github.com
 token_var = GITHUB_API_TOKEN
+work_dir = github.com
 repo_check_endpoint = /repos/{owner}/{repo}
 repo_check_method = GET
 repo_check_success_key = id
@@ -107,6 +108,7 @@ api_base = https://gitlab.com/api/v4
 ssh_host = gitlab.com
 repo_domain = gitlab.com
 token_var = GITLAB_API_TOKEN
+work_dir = gitlab.com
 repo_check_endpoint = /projects/{owner}%2F{repo}
 repo_check_method = GET
 repo_check_success_key = id
@@ -153,7 +155,15 @@ EOF
                 enabled)
                     [[ "$value" == "true" ]] && PLATFORM_ENABLED["$current_section"]=true
                     ;;
-                api_base|ssh_host|repo_domain|token_var|work_dir|auth_header|auth_query_param|owner_not_found_patterns|ssh_url_fields|visibility_map|auth_header_name|authenticated_user_endpoint|authenticated_user_key|accept_header)
+                work_dir)
+                    if [[ ! "$value" =~ ^[A-Za-z0-9._-]+$ || "$value" == "." || "$value" == ".." ]]; then
+                        echo -e "${RED}❌ Invalid work_dir '$value' for [$current_section] in $CONFIG_FILE${NC}" >&2
+                        echo -e "${YELLOW}   work_dir must be a single directory name: no '/', not '.' or '..'.${NC}" >&2
+                        return 1
+                    fi
+                    PLATFORM_WORK_DIR["$current_section"]="$value"
+                    ;;
+                api_base|ssh_host|repo_domain|token_var|auth_header|auth_query_param|owner_not_found_patterns|ssh_url_fields|visibility_map|auth_header_name|authenticated_user_endpoint|authenticated_user_key|accept_header)
                     declare -g "PLATFORM_${key^^}"["$current_section"]="$value"
                     ;;
                 repo_check_endpoint|repo_check_method|repo_check_success_key|repo_create_endpoint|repo_create_method|repo_list_endpoint|repo_list_success_key|repo_delete_endpoint|repo_delete_method|payload_template|ssh_url_template|display_format)
@@ -163,6 +173,16 @@ EOF
             esac
         fi
     done < "$CONFIG_FILE"
+    # Default a missing work_dir to repo_domain, then to the platform name
+    local fallback
+    for platform in "${!PLATFORM_ENABLED[@]}"; do
+        [[ -n "${PLATFORM_WORK_DIR[$platform]:-}" ]] && continue
+        fallback="${PLATFORM_REPO_DOMAIN[$platform]:-}"
+        if [[ ! "$fallback" =~ ^[A-Za-z0-9._-]+$ || "$fallback" == "." || "$fallback" == ".." ]]; then
+            fallback="$platform"
+        fi
+        PLATFORM_WORK_DIR["$platform"]="$fallback"
+    done
     # Build list of ENABLED platforms
     for platform in "${!PLATFORM_ENABLED[@]}"; do
         if [[ "${PLATFORM_ENABLED[$platform]}" == "true" ]] && \
@@ -291,37 +311,54 @@ test_platform_config() {
     done
 
     echo ""
-    read -rp "Press Enter to continue..." -n 1
+    read -rp "Press Enter to continue..." -n 1 || true
     echo ""
     warn_duplicate_remote_connections
     sleep 5
 }
 
 # ======================= CORE VALIDATION FUNCTIONS ===========================
-# Check if a local Git repo exists
+# Check if a local Git repo exists (works for worktrees and submodules too)
 check_local_exists() {
-    [[ -d "$1/.git" ]]
+    local dir="${1:-}"
+    [[ -n "$dir" ]] && git -C "$dir" rev-parse --git-dir >/dev/null 2>&1
 }
 
 # Ensure we're not in a system directory
 is_safe_directory() {
-    local target_dir="$1"
+    local target_dir="${1:-$(pwd)}"
+    local canon
+    canon=$(realpath -m -- "$target_dir" 2>/dev/null) || canon="$target_dir"
 
     # First check for root directory
-    if [[ "$target_dir" == "/" ]]; then
+    if [[ "$canon" == "/" ]]; then
         echo -e "${RED}❌ ERROR: Cannot operate in root directory '/'.${NC}"
         echo "Please run from a safe directory (e.g., ~/Projects)."
         return 1
     fi
 
-    # Then check other forbidden prefixes
+    # Then check other forbidden prefixes (boundary-aware, so /etcetera is allowed)
+    local dir dir_canon
     for dir in "${FORBIDDEN_DIRS[@]}"; do
-        if [[ "$target_dir" == "$dir"* ]]; then
+        dir_canon=$(realpath -m -- "$dir" 2>/dev/null) || dir_canon="$dir"
+        if [[ "$canon" == "$dir_canon" || "$canon" == "$dir_canon/"* ]]; then
             echo -e "${RED}❌ ERROR: Cannot operate in system directory '$dir'.${NC}"
             return 1
         fi
     done
     return 0
+}
+
+# True when a path resolves to a strict child of PROJECT_ROOT
+_is_under_project_root() {
+    local target="$1"
+    [[ -n "$target" ]] || return 1
+
+    local target_canon root_canon
+    target_canon=$(realpath -m -- "$target" 2>/dev/null) || return 1
+    root_canon=$(realpath -m -- "$PROJECT_ROOT" 2>/dev/null) || return 1
+
+    [[ "$target_canon" == "$root_canon/"* ]]
 }
 
 # Check SSH authentication for a given host
@@ -330,12 +367,19 @@ check_ssh_auth() {
     local platform_name="$2"
     echo -n "Testing SSH connection to ${platform_name:-$host}... "
 
-    local ssh_command="ssh -T -o ConnectTimeout=10 -o BatchMode=yes git@$host"
+    # The host comes from platforms.conf; keep it to a DNS-name shape so it
+    # cannot smuggle shell syntax or extra ssh arguments.
+    if [[ ! "$host" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        echo -e "${RED}❌ Invalid SSH host in configuration: '$host'${NC}"
+        return 1
+    fi
+
+    local -a ssh_cmd=(ssh -T -o ConnectTimeout=10 -o BatchMode=yes "git@$host")
     local ssh_output=""
+    local exit_code=0
 
     # Execute SSH command and capture ALL output
-    ssh_output=$(timeout 15 bash -c "$ssh_command" 2>&1)
-    local exit_code=$?
+    ssh_output=$(timeout 15 "${ssh_cmd[@]}" 2>&1) || exit_code=$?
 
     # SUCCESS if exit code is 0 OR 1 (GitHub returns 1 for "no shell access")
     if [[ $exit_code -eq 0 || $exit_code -eq 1 ]]; then
@@ -344,7 +388,7 @@ check_ssh_auth() {
         return 0
     else
         echo -e "${RED}❌ Failed (exit code: $exit_code)${NC}"
-        echo -e "${YELLOW}Manual test command: $ssh_command${NC}" >&2
+        echo -e "${YELLOW}Manual test command: ssh -T -o ConnectTimeout=10 -o BatchMode=yes git@$host${NC}" >&2
         echo -e "${YELLOW}Output: ${ssh_output:0:100}...${NC}" >&2
         return 1
     fi
@@ -482,7 +526,7 @@ warn_similar_remote_repos() {
             echo -e "    - $repo"
         done <<< "$similar_repos"
         echo ""
-        return 1 # Return a warning status
+        return 0 # Warning only; callers continue
     else
         echo -e "${GREEN}✅ Clear${NC}"
         return 0
@@ -510,9 +554,8 @@ warn_duplicate_remote_connections() {
     # Check which remotes have more than one path
     for url in "${!remote_map[@]}"; do
         local paths="${remote_map[$url]}"
-        # Count the delimiters to get number of paths
+        # Count the non-empty path entries
         local count=$(echo "$paths" | tr '|' '\n' | grep -c .)
-        ((count--)) # Subtract the initial empty element
 
         if [[ $count -gt 1 ]]; then
             if [[ $duplicate_found -eq 0 ]]; then
@@ -532,7 +575,6 @@ warn_duplicate_remote_connections() {
     else
         echo -e "${YELLOW}  ⚠️  Multiple local directories are connected to the same remote."
         echo -e "  This can cause confusion when pushing/pulling.${NC}"
-        return 1
     fi
     printf "\n" >&2
     return 0
@@ -885,13 +927,10 @@ sync_with_remote() {
 
     # Get current branch if not provided
     if [[ -z "$current_branch" ]]; then
-        current_branch=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo "main")
-        # Handle detached HEAD
-        if [[ "$current_branch" =~ ^[0-9a-f]{7,}$ ]] || [[ "$current_branch" == "HEAD" ]]; then
-            # Try to get default branch from remote
-            local default_branch=$(git ls-remote --symref "$remote_url" HEAD 2>/dev/null | awk -F'[/]' '/symref/ {print $3}' | head -1)
-            [[ -z "$default_branch" ]] && default_branch="main"
-            current_branch="$default_branch"
+        current_branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+        if [[ -z "$current_branch" ]]; then
+            echo -e "${RED}❌ Cannot determine the current branch (detached HEAD?).${NC}"
+            return 1
         fi
     fi
 
@@ -901,7 +940,9 @@ sync_with_remote() {
 
     # Check remote accessibility with timeout
     echo -n "Checking remote accessibility... "
-    if timeout 5 git ls-remote --exit-code "$remote_url" &>/dev/null; then
+    # A reachable but empty repository exits non-zero with --exit-code, so do
+    # not use it here: an empty remote is exactly what a new repo looks like.
+    if timeout 5 git ls-remote "$remote_url" &>/dev/null; then
         echo -e "${GREEN}✓ Accessible${NC}"
     else
         echo -e "${RED}✗ Cannot access remote${NC}"
@@ -921,154 +962,216 @@ sync_with_remote() {
     fi
     echo -e "${GREEN}✓ Fetched${NC}"
 
-    # Determine remote's default branch
-    local remote_branch
-    remote_branch=$(git ls-remote --symref "$remote_url" HEAD 2>/dev/null | \
-        awk -F'[/]' '/symref/ {print $3}' | head -1 || echo "main")
+    # Branch inventory
+    local -a local_branches=() remote_branches=() local_only=() remote_only=()
+    mapfile -t local_branches < <(git for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null | sort)
+    mapfile -t remote_branches < <(git for-each-ref --format='%(refname:lstrip=3)' "refs/remotes/$platform/" 2>/dev/null | grep -v '^HEAD$' | sort)
 
-    echo -e "  Remote branch: $platform/$remote_branch"
-    echo -e "  Local branch : $current_branch"
+    local b rb found
+    for b in "${local_branches[@]}"; do
+        found=false
+        for rb in "${remote_branches[@]}"; do
+            [[ "$b" == "$rb" ]] && { found=true; break; }
+        done
+        [[ "$found" == "true" ]] || local_only+=("$b")
+    done
+    for rb in "${remote_branches[@]}"; do
+        found=false
+        for b in "${local_branches[@]}"; do
+            [[ "$b" == "$rb" ]] && { found=true; break; }
+        done
+        [[ "$found" == "true" ]] || remote_only+=("$rb")
+    done
 
-    # Branch alignment (rename local if needed)
-    if [[ "$current_branch" != "$remote_branch" ]]; then
-        echo -e "${YELLOW}⚠️  Branch mismatch: local '$current_branch' vs remote '$remote_branch'${NC}"
-        if [[ "$dry_run_mode" != "true" ]] && confirm_action "Rename local branch to match remote?" "y" "Rename"; then
-            execute_dangerous "Rename branch" git branch -m "$current_branch" "$remote_branch" >/dev/null 2>&1
-            current_branch="$remote_branch"
-            echo -e "${GREEN}✓ Renamed to '$remote_branch'${NC}"
-        elif [[ "$dry_run_mode" == "true" ]]; then
-            echo -e "${YELLOW}⚠️  DRY-RUN: Would ask about renaming branch.${NC}"
-        fi
+    echo -e "\n${BLUE}Branch inventory:${NC}"
+    echo -e "  Current    : ${CYAN}$current_branch${NC}"
+    echo -e "  Local-only : ${#local_only[@]}${local_only[*]:+ (${local_only[*]})}"
+    echo -e "  Remote-only: ${#remote_only[@]}${remote_only[*]:+ (${remote_only[*]})}"
+
+    # Never rename branches; just report a different remote default
+    local remote_default
+    remote_default=$(git ls-remote --symref "$remote_url" HEAD 2>/dev/null | \
+        awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
+    if [[ -n "$remote_default" && "$remote_default" != "$current_branch" ]]; then
+        echo -e "${YELLOW}ℹ️  Remote default is '$remote_default'; staying on '$current_branch'.${NC}"
     fi
 
-    # Analyze divergence
-    git fetch "$platform" "$remote_branch"
-    if [[ $? -ne 0 ]]; then
-        echo -e "${RED}❌ Failed to fetch from remote '$platform' branch '$remote_branch'.${NC}" >&2
-        return 1
-    fi
-    local ahead=0 behind=0
-    ahead=$(git rev-list --count "$platform/$remote_branch..$current_branch")
-    if [[ $? -ne 0 ]]; then
-        echo -e "${RED}❌ Failed to count ahead commits.${NC}" >&2
-        return 1
-    fi
-    behind=$(git rev-list --count "$current_branch..$platform/$remote_branch")
-    if [[ $? -ne 0 ]]; then
-        echo -e "${RED}❌ Failed to count behind commits.${NC}" >&2
-        return 1
-    fi
+    # Is the current branch on the remote?
+    local current_on_remote=false
+    for rb in "${remote_branches[@]}"; do
+        [[ "$rb" == "$current_branch" ]] && { current_on_remote=true; break; }
+    done
 
-    echo -e "\n${BLUE}Divergence analysis:${NC}"
-    echo "  Local is $ahead commit(s) ahead of remote"
-    echo "  Local is $behind commit(s) behind remote"
-
-    # Handle different synchronization scenarios
-    if [[ "$behind" -eq 0 && "$ahead" -eq 0 ]]; then
-        # Scenario 1: Identical branches
-        echo -e "${GREEN}✓ No divergence - branches are identical${NC}"
-        if [[ "$dry_run_mode" != "true" ]] && confirm_action "Push to $platform?" "y" "Push"; then
-            execute_dangerous "Push" git push -u "$platform" "$current_branch"
-        elif [[ "$dry_run_mode" == "true" ]]; then
-            echo -e "${YELLOW}⚠️  DRY-RUN: Would push to $platform.${NC}"
-        fi
-        return 0
-
-    elif [[ "$behind" -eq 0 && "$ahead" -gt 0 ]]; then
-        # Scenario 2: Only local commits
-        echo -e "${GREEN}✓ Only local commits (no remote changes)${NC}"
+    if [[ "$current_on_remote" == "false" ]]; then
+        echo -e "\n${YELLOW}Current branch '$current_branch' is not on '$platform'.${NC}"
         if [[ "$dry_run_mode" != "true" ]]; then
-            if confirm_action "Push $ahead commit(s) to $platform?" "y" "Push"; then
-                execute_dangerous "Push" git push -u "$platform" "$current_branch"
+            if confirm_action "Push '$current_branch' to '$platform' and set upstream?" "y" "Push"; then
+                execute_dangerous "Push new branch" git push -u "$platform" "$current_branch"
             fi
         else
-            echo -e "${YELLOW}⚠️  DRY-RUN: Would push $ahead commit(s).${NC}"
+            echo -e "${YELLOW}⚠️  DRY-RUN: Would push '$current_branch' to '$platform'.${NC}"
         fi
-        return 0
+    else
+        local remote_branch="$current_branch"
+        echo -e "  Remote branch: $platform/$remote_branch"
+        echo -e "  Local branch : $current_branch"
 
-    elif [[ "$behind" -gt 0 ]]; then
-        # Scenario 3: Divergence detected
-        echo -e "${YELLOW}⚠️  DIVERGENCE DETECTED: Remote has $behind new commit(s)${NC}"
+        # Analyze divergence
+        git fetch "$platform" "$remote_branch"
+        if [[ $? -ne 0 ]]; then
+            echo -e "${RED}❌ Failed to fetch from remote '$platform' branch '$remote_branch'.${NC}" >&2
+            return 1
+        fi
+        local ahead=0 behind=0
+        ahead=$(git rev-list --count "$platform/$remote_branch..$current_branch")
+        if [[ $? -ne 0 ]]; then
+            echo -e "${RED}❌ Failed to count ahead commits.${NC}" >&2
+            return 1
+        fi
+        behind=$(git rev-list --count "$current_branch..$platform/$remote_branch")
+        if [[ $? -ne 0 ]]; then
+            echo -e "${RED}❌ Failed to count behind commits.${NC}" >&2
+            return 1
+        fi
 
-        # Handle uncommitted changes
-        local stashed=false
-        if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
-            echo -e "${YELLOW}Stashing uncommitted changes...${NC}"
-            if git stash push -m "repo-crafter: pre-sync" --quiet; then
-                stashed=true
-                echo -e "${GREEN}✓ Stashed${NC}"
-            else
-                echo -e "${RED}✗ Failed to stash changes${NC}"
-                return 1
+        echo -e "\n${BLUE}Divergence analysis:${NC}"
+        echo "  Local is $ahead commit(s) ahead of remote"
+        echo "  Local is $behind commit(s) behind remote"
+
+        if [[ "$behind" -eq 0 && "$ahead" -eq 0 ]]; then
+            # Scenario 1: Identical branches
+            echo -e "${GREEN}✓ No divergence - branches are identical${NC}"
+            if [[ "$dry_run_mode" != "true" ]] && confirm_action "Push to $platform?" "y" "Push"; then
+                execute_dangerous "Push" git push -u "$platform" "$current_branch"
+            elif [[ "$dry_run_mode" == "true" ]]; then
+                echo -e "${YELLOW}⚠️  DRY-RUN: Would push to $platform.${NC}"
             fi
-        fi
+        elif [[ "$behind" -eq 0 && "$ahead" -gt 0 ]]; then
+            # Scenario 2: Only local commits
+            echo -e "${GREEN}✓ Only local commits (no remote changes)${NC}"
+            if [[ "$dry_run_mode" != "true" ]]; then
+                if confirm_action "Push $ahead commit(s) to $platform?" "y" "Push"; then
+                    execute_dangerous "Push" git push -u "$platform" "$current_branch"
+                fi
+            else
+                echo -e "${YELLOW}⚠️  DRY-RUN: Would push $ahead commit(s).${NC}"
+            fi
+        elif [[ "$behind" -gt 0 ]]; then
+            # Scenario 3: Divergence detected
+            echo -e "${YELLOW}⚠️  DIVERGENCE DETECTED: Remote has $behind new commit(s)${NC}"
 
-        echo -e "\n${BLUE}Integration options:${NC}"
-        echo "  1) Rebase (clean history)"
-        echo "  2) Merge (safer for collaboration)"
-        echo "  3) Skip - Push anyway (divergent branches)"
-        echo "  x) Cancel"
+            # Handle uncommitted changes
+            local stashed=false
+            if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+                echo -e "${YELLOW}Stashing uncommitted changes...${NC}"
+                if git stash push -m "repo-crafter: pre-sync" --quiet; then
+                    stashed=true
+                    echo -e "${GREEN}✓ Stashed${NC}"
+                else
+                    echo -e "${RED}✗ Failed to stash changes${NC}"
+                    return 1
+                fi
+            fi
 
-        local sync_choice=""
-        read -rp "Choice (1-3 or x): " sync_choice
+            echo -e "\n${BLUE}Integration options:${NC}"
+            echo "  1) Rebase (clean history)"
+            echo "  2) Merge (safer for collaboration)"
+            echo "  3) Skip - Push anyway (divergent branches)"
+            echo "  x) Cancel"
 
-        case "$sync_choice" in
-            1) # REBASE
-                echo -e "\n${BLUE}Rebasing local commits...${NC}"
-                if execute_dangerous "Rebase onto $platform/$remote_branch" git rebase "$platform/$remote_branch" --quiet; then
-                    echo -e "${GREEN}✓ Rebase successful${NC}"
-                    if [[ "$stashed" == "true" ]]; then
-                        echo -n "Applying stashed changes... "
-                        if git stash pop --quiet; then
-                            echo -e "${GREEN}✓ Restored${NC}"
-                        else
-                            echo -e "${YELLOW}⚠️  Auto-merge failed. Run: git stash pop${NC}"
+            local sync_choice=""
+            read -rp "Choice (1-3 or x): " sync_choice || sync_choice=""
+
+            case "$sync_choice" in
+                1) # REBASE
+                    echo -e "\n${BLUE}Rebasing local commits...${NC}"
+                    if execute_dangerous "Rebase onto $platform/$remote_branch" git rebase "$platform/$remote_branch" --quiet; then
+                        echo -e "${GREEN}✓ Rebase successful${NC}"
+                        if [[ "$stashed" == "true" ]]; then
+                            echo -n "Applying stashed changes... "
+                            if git stash pop --quiet; then
+                                echo -e "${GREEN}✓ Restored${NC}"
+                            else
+                                echo -e "${YELLOW}⚠️  Auto-merge failed. Run: git stash pop${NC}"
+                            fi
                         fi
-                    fi
 
-                    if [[ "$dry_run_mode" != "true" ]] && confirm_action "Push rebased branch?" "y" "Push"; then
-                        execute_dangerous "Push" git push -u "$platform" "$current_branch"
+                        if [[ "$dry_run_mode" != "true" ]] && confirm_action "Push rebased branch?" "y" "Push"; then
+                            execute_dangerous "Push" git push -u "$platform" "$current_branch"
+                        fi
+                    else
+                        echo -e "${RED}✗ Rebase failed. Resolve conflicts manually.${NC}"
+                        [[ "$stashed" == "true" ]] && echo -e "${YELLOW}⚠️  Your changes are stashed.${NC}"
+                        return 1
                     fi
-                else
-                    echo -e "${RED}✗ Rebase failed. Resolve conflicts manually.${NC}"
-                    [[ "$stashed" == "true" ]] && echo -e "${YELLOW}⚠️  Your changes are stashed.${NC}"
+                    ;;
+
+                2) # MERGE
+                    echo -e "\n${BLUE}Merging remote changes...${NC}"
+                    if execute_dangerous "Merge remote" git merge "$platform/$remote_branch" --no-edit --quiet; then
+                        echo -e "${GREEN}✓ Merge successful${NC}"
+                        if [[ "$dry_run_mode" != "true" ]] && confirm_action "Push merged branch?" "y" "Push"; then
+                            execute_dangerous "Push" git push -u "$platform" "$current_branch"
+                        fi
+                    else
+                        echo -e "${RED}✗ Merge conflict. Resolve conflicts manually.${NC}"
+                        return 1
+                    fi
+                    ;;
+
+                3) # SKIP
+                    echo -e "${YELLOW}⚠️  Will create divergent branches${NC}"
+                    if [[ "$dry_run_mode" != "true" ]] && confirm_action "Push anyway?" "n" "Force push"; then
+                        execute_dangerous "Push with divergence" git push -u "$platform" "$current_branch"
+                    fi
+                    ;;
+
+                x|X|"")
+                    echo -e "${YELLOW}Synchronization cancelled.${NC}"
+                    # Restore stashed changes if any
+                    [[ "$stashed" == "true" ]] && git stash pop --quiet >/dev/null 2>&1
                     return 1
-                fi
-                ;;
+                    ;;
 
-            2) # MERGE
-                echo -e "\n${BLUE}Merging remote changes...${NC}"
-                if execute_dangerous "Merge remote" git merge "$platform/$remote_branch" --no-edit --quiet; then
-                    echo -e "${GREEN}✓ Merge successful${NC}"
-                    if [[ "$dry_run_mode" != "true" ]] && confirm_action "Push merged branch?" "y" "Push"; then
-                        execute_dangerous "Push" git push -u "$platform" "$current_branch"
-                    fi
-                else
-                    echo -e "${RED}✗ Merge conflict. Resolve conflicts manually.${NC}"
+                *)
+                    echo -e "${RED}Invalid choice. Synchronization cancelled.${NC}"
+                    [[ "$stashed" == "true" ]] && git stash pop --quiet >/dev/null 2>&1
                     return 1
-                fi
-                ;;
+                    ;;
+            esac
+        fi
+    fi
 
-            3) # SKIP
-                echo -e "${YELLOW}⚠️  Will create divergent branches${NC}"
-                if [[ "$dry_run_mode" != "true" ]] && confirm_action "Push anyway?" "n" "Force push"; then
-                    execute_dangerous "Push with divergence" git push -u "$platform" "$current_branch"
-                fi
-                ;;
+    # Offer to push local-only branches. Never merge/rebase a branch that is
+    # not checked out; that needs a checkout or worktree and is a separate flow.
+    local -a other_local_only=()
+    for b in "${local_only[@]}"; do
+        [[ "$b" == "$current_branch" ]] || other_local_only+=("$b")
+    done
+    if [[ ${#other_local_only[@]} -gt 0 ]]; then
+        echo -e "\n${YELLOW}Local branches not on '$platform': ${other_local_only[*]}${NC}"
+        if [[ "$dry_run_mode" != "true" ]]; then
+            if confirm_action "Push these branches to '$platform'?" "n" "Push branches"; then
+                for b in "${other_local_only[@]}"; do
+                    [[ "$b" == "$current_branch" ]] && continue
+                    if execute_dangerous "Push $b" git push -u "$platform" "$b"; then
+                        echo -e "${GREEN}✓ Pushed $b${NC}"
+                    else
+                        echo -e "${YELLOW}⚠️  Failed to push $b${NC}"
+                    fi
+                done
+            fi
+        else
+            echo -e "${YELLOW}⚠️  DRY-RUN: Would offer to push local-only branches.${NC}"
+        fi
+    fi
 
-            x|X|"")
-                echo -e "${YELLOW}Synchronization cancelled.${NC}"
-                # Restore stashed changes if any
-                [[ "$stashed" == "true" ]] && git stash pop --quiet >/dev/null 2>&1
-                return 1
-                ;;
-
-            *)
-                echo -e "${RED}Invalid choice. Synchronization cancelled.${NC}"
-                [[ "$stashed" == "true" ]] && git stash pop --quiet >/dev/null 2>&1
-                return 1
-                ;;
-        esac
+    if [[ ${#remote_only[@]} -gt 0 ]]; then
+        echo -e "\n${YELLOW}Remote branches not local: ${remote_only[*]}${NC}"
+        echo -e "${YELLOW}  Not checked out automatically. Create them with:${NC}"
+        for b in "${remote_only[@]}"; do
+            echo "    git switch -c $b $platform/$b"
+        done
     fi
 
     return 0
@@ -1109,7 +1212,7 @@ create_new_project_workflow() {
         fi
 
         _create_with_new_remote "$project_name" "$visibility" "$platform" ;;
-    2) _clone_existing_remote "standalone" ;;
+    2) _clone_existing_remote "standalone" >/dev/null ;;
     3) _create_local_only ;;
     x|X) echo -e "${YELLOW}Cancelled.${NC}"; return ;;
     *) echo -e "${RED}Invalid choice.${NC}" ;;
@@ -1133,6 +1236,20 @@ _create_with_new_remote() {
   echo -e "Project: ${CYAN}$project_name${NC}"
   echo -e "Visibility: ${CYAN}$visibility${NC}"
   echo -e "Local path: ${CYAN}$dir${NC}"
+
+  # Never reuse an existing destination: refusing here keeps the later
+  # cleanup path from deleting a folder that was not ours to begin with.
+  if [[ -e "$dir" ]]; then
+    echo -e "${RED}❌ Destination already exists: $dir${NC}"
+    echo -e "${YELLOW}Choose another project name. Nothing was created.${NC}"
+    return 1
+  fi
+
+  # Warn if a repository with this name already exists elsewhere under PROJECT_ROOT
+  if ! warn_duplicate_repo_name "$project_name" "$(dirname "$dir")"; then
+    echo -e "${YELLOW}Cancelled. Nothing was created.${NC}"
+    return 1
+  fi
 
   # DRY RUN handling
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -1162,7 +1279,6 @@ _create_with_new_remote() {
   echo -e "  URL: ${CYAN}$remote_url${NC}"
 
   # Initialize local repository with cleanup on failure
-  local local_created=false
   echo -e "\n${BLUE}Initializing local repository...${NC}"
 
   if ! mkdir -p "$dir"; then
@@ -1171,34 +1287,35 @@ _create_with_new_remote() {
     return 1
   fi
 
-  cd "$dir" || { echo -e "${RED}❌ Failed to enter project directory${NC}"; _cleanup_failed_creation "$platform" "$project_name" "$remote_url"; return 1; }
-
   # Initialize git with dynamic branch detection
   local default_branch
   default_branch=$(git config --get init.defaultBranch 2>/dev/null || echo "main")
 
-  if ! git init -b "$default_branch" >/dev/null 2>&1; then
+  if ! git -C "$dir" init -b "$default_branch" >/dev/null 2>&1; then
     echo -e "${RED}❌ Failed to initialize git repository${NC}"
     _cleanup_failed_creation "$platform" "$project_name" "$remote_url"
     return 1
   fi
 
   # Create initial commit
-  echo "# $project_name" > README.md
-  if ! git add README.md 2>/dev/null; then
+  echo "# $project_name" > "$dir/README.md"
+  if ! git -C "$dir" add README.md 2>/dev/null; then
       echo -e "${RED}❌ Failed to add README.md${NC}" >&2
+      _cleanup_failed_creation "$platform" "$project_name" "$remote_url"
       return 1
   fi
 
-  if ! git commit -m "Initial commit" 2>/dev/null; then
+  if ! git -C "$dir" commit -m "Initial commit" 2>/dev/null; then
       echo -e "${RED}❌ Failed to create initial commit${NC}" >&2
+      _cleanup_failed_creation "$platform" "$project_name" "$remote_url"
       return 1
   fi
 
   # Add remote
-  if ! git remote add "$platform" "$remote_url" 2>&1; then
+  if ! git -C "$dir" remote add "$platform" "$remote_url" 2>&1; then
       echo -e "${RED}❌ Failed to add remote '$platform'${NC}" >&2
       echo -e "${YELLOW}Remote may already exist. Try removing it first.${NC}"
+      _cleanup_failed_creation "$platform" "$project_name" "$remote_url"
       return 1
   fi
    echo -e "  Added remote: ${CYAN}$platform${NC}"
@@ -1207,7 +1324,6 @@ _create_with_new_remote() {
   echo -e "${YELLOW}You can push manually later using:${NC}"
   echo -e "      git push -u $platform $default_branch${NC}"
 
-  local_created=true
   echo -e "${GREEN}✓ Repository created${NC}"
 
   # NOTE: Manifest (REMOTE_STATE.yml) is only created for multi-platform projects
@@ -1229,24 +1345,30 @@ _cleanup_failed_creation() {
 
     echo -e "\n${YELLOW}Cleaning up partial creation...${NC}"
 
-    # Try to delete remote repository using standard API endpoint
+    # Try to delete remote repository using the platform's delete endpoint
     if [[ -n "$remote_url" ]]; then
         echo -e "  Attempting to delete remote repository..."
 
-        # Extract owner/repo from URL using generic method
-        local owner_repo=$(echo "$remote_url" | sed -E 's/.*[:/]([^:]*\/[^.]*)\.git/\1/')
-        local owner=$(echo "$owner_repo" | cut -d/ -f1)
-        local repo=$(echo "$owner_repo" | cut -d/ -f2)
+        local owner repo
+        owner=$(get_owner_from_ssh_url "$remote_url" 2>/dev/null) || owner=""
+        repo=$(basename "$(parse_git_url "$remote_url")")
 
-        # Use standard GitHub-style endpoint which works for most platforms
-        # Use platform-specific endpoint, don't hardcode GitHub format
-        local delete_endpoint="${PLATFORM_REPO_CHECK_ENDPOINT[$platform]}"
-        delete_endpoint="${delete_endpoint//\{owner\}/$owner}"
-        delete_endpoint="${delete_endpoint//\{repo\}/$repo}"
+        local delete_endpoint="${PLATFORM_REPO_DELETE_ENDPOINT[$platform]:-}"
+        local delete_method="${PLATFORM_REPO_DELETE_METHOD[$platform]:-DELETE}"
 
-        # Attempt deletion
-        platform_api_call "$platform" "$delete_endpoint" "DELETE" >/dev/null 2>&1
-        echo -e "  ${YELLOW}Remote cleanup attempted${NC}"
+        if [[ -z "$owner" || -z "$repo" || -z "$delete_endpoint" ]]; then
+            echo -e "  ${YELLOW}⚠️  Cannot delete remote automatically (missing owner, repo, or delete endpoint).${NC}"
+            echo -e "  ${YELLOW}   Remove it manually: $remote_url${NC}"
+        else
+            delete_endpoint="${delete_endpoint//\{owner\}/$owner}"
+            delete_endpoint="${delete_endpoint//\{repo\}/$repo}"
+
+            if _delete_remote_quiet "$platform" "$delete_endpoint" "$delete_method"; then
+                echo -e "  ${GREEN}✓ Remote repository deleted${NC}"
+            else
+                echo -e "  ${YELLOW}⚠️  Remote deletion failed; remove it manually: $remote_url${NC}"
+            fi
+        fi
     fi
 
     # Delete local directory
@@ -1255,7 +1377,7 @@ _cleanup_failed_creation() {
 
     if [[ -d "$dir" ]]; then
         echo -e "  Deleting local directory..."
-        rm -rf "$dir" 2>/dev/null
+        rm -rf -- "$dir" 2>/dev/null
         echo -e "  ${YELLOW}Local cleanup attempted${NC}"
     fi
 }
@@ -1269,7 +1391,7 @@ _clone_existing_remote() {
   shift  # Remove the mode from arguments
   local urls=("$@")  # All remaining arguments are URLs
 
-  echo -e "\n${BLUE}=== Clone Existing Repository ===${NC}"
+  echo -e "\n${BLUE}=== Clone Existing Repository ===${NC}" >&2
 
   # --- PART 1: GET THE URL(S) ---
   local first_url=""
@@ -1277,20 +1399,20 @@ _clone_existing_remote() {
   if [[ "$mode" == "binding" && ${#urls[@]} -gt 0 ]]; then
     # Mode 1: Called from convert_local_to_remote with a pre-provided list
     first_url="${urls[0]}"
-    echo -e "${GREEN}Using URL from binding workflow...${NC}"
+    echo -e "${GREEN}Using URL from binding workflow...${NC}" >&2
   else
     # Mode 2: Standalone mode - interactively ask for one URL (old behavior)
-    echo -e "${YELLOW}Enter repository URL:${NC}"
-    echo "Example: git@github.com:user/repo.git"
+    echo -e "${YELLOW}Enter repository URL:${NC}" >&2
+    echo "Example: git@github.com:user/repo.git" >&2
     read -rp "URL: " first_url
     [[ -z "$first_url" ]] && return
   fi
 
-  [[ -z "$first_url" ]] && { echo -e "${RED}No URL provided.${NC}"; return 1; }
+  [[ -z "$first_url" ]] && { echo -e "${RED}No URL provided.${NC}" >&2; return 1; }
 
   # --- PART 2: PARSE URL & DETECT PLATFORM (Your existing code) ---
   local parsed_path=$(parse_git_url "$first_url")
-  [[ -z "$parsed_path" ]] && { echo -e "${RED}Invalid URL format${NC}"; return 1; }
+  [[ -z "$parsed_path" ]] && { echo -e "${RED}Invalid URL format${NC}" >&2; return 1; }
   local repo_name
   repo_name=$(safe_dir_name "$parsed_path")
   if [[ "$repo_name" != "$(basename "$parsed_path")" ]]; then
@@ -1301,7 +1423,7 @@ _clone_existing_remote() {
   host=$(extract_host_from_url "$first_url")
 
   local platform=""
-  platform=$(detect_platform_from_url "$first_url") || { echo -e "${RED}Unknown platform for URL: $first_url${NC}"; return 1; }
+  platform=$(detect_platform_from_url "$first_url") || { echo -e "${RED}Unknown platform for URL: $first_url${NC}" >&2; return 1; }
 
   # --- PART 3: DECIDE DESTINATION DIRECTORY (THE NEW LOGIC) ---
   local dest_dir=""
@@ -1309,11 +1431,11 @@ _clone_existing_remote() {
   if [[ "$mode" == "binding" && ${#urls[@]} -gt 1 ]]; then
     # MULTI-PLATFORM BINDING: Clone to Multi-server
     dest_dir="$REMOTE_ROOT/Multi-server/$repo_name"
-    echo -e "${BLUE}Multi-platform mode: Cloning to Multi-server/${NC}"
+    echo -e "${BLUE}Multi-platform mode: Cloning to Multi-server/${NC}" >&2
   else
     # SINGLE PLATFORM: Clone to platform-specific directory
     dest_dir="$REMOTE_ROOT/${PLATFORM_WORK_DIR[$platform]}/$repo_name"
-    echo -e "${BLUE}Single platform ($platform): Cloning to ${PLATFORM_WORK_DIR[$platform]}/${NC}"
+    echo -e "${BLUE}Single platform ($platform): Cloning to ${PLATFORM_WORK_DIR[$platform]}/${NC}" >&2
   fi
 
   # --- PART 4: CLONE (Your existing code) ---
@@ -1322,22 +1444,22 @@ _clone_existing_remote() {
       check_ssh_auth "$host" "$platform" || return 1
   fi
 
-  # Clone
-  echo -e "\n${BLUE}Cloning to: $dest_dir${NC}"
-  if ! git clone "$first_url" "$dest_dir" 2>&1 | head -30; then
+  # Clone (no pipe: keep git's exit status and full error output)
+  echo -e "\n${BLUE}Cloning to: $dest_dir${NC}" >&2
+  if ! git clone "$first_url" "$dest_dir"; then
       echo -e "${RED}❌ Failed to clone repository${NC}" >&2
-      echo -e "${YELLOW}Check: 1) URL is correct 2) SSH keys configured 3) Repository exists${NC}"
+      echo -e "${YELLOW}Check: 1) URL is correct 2) SSH keys configured 3) Repository exists${NC}" >&2
       return 1
   fi
-  echo -e "${GREEN}✅ Cloned to $dest_dir${NC}"
+  echo -e "${GREEN}✅ Cloned to $dest_dir${NC}" >&2
 
   # --- PART 5: RETURN THE PATH ---
-  # CRITICAL: Echo the destination directory so the caller can use it
+  # Only the path goes to stdout so callers can capture it
   echo "$dest_dir"
 
   # Only pause in standalone mode
   if [[ "$mode" == "standalone" ]]; then
-      read -rp "Press Enter to continue..." -n 1
+      read -rp "Press Enter to continue..." -n 1 || true
   fi
 
   return 0
@@ -1351,20 +1473,33 @@ _create_local_only() {
   [[ -n "$project_name" ]] || return
 
   dest_dir="$LOCAL_ROOT/$project_name"
-  [[ -d "$dest_dir" ]] && { echo -e "${RED}Exists.${NC}"; return; }
+  [[ -d "$dest_dir" ]] && { echo -e "${RED}Destination already exists: $dest_dir${NC}"; return 1; }
+
+  # Warn if a repository with this name already exists elsewhere under PROJECT_ROOT
+  if ! warn_duplicate_repo_name "$project_name" "$LOCAL_ROOT"; then
+    echo -e "${YELLOW}Cancelled. Nothing was created.${NC}"
+    return 1
+  fi
 
   execute_safe "Create project directory" mkdir -p "$dest_dir"
-  execute_safe "Change to project directory" cd "$dest_dir"
-  local default_branch=$(detect_current_branch)
-  execute_safe "Initialize git repository" git init -b "$default_branch"
-  remove_existing_remotes # removes remote to keep the project locally isolated
-  # ADDITIONAL FIX: Show git errors instead of silent failures
-  execute_safe "Create README.md" sh -c "echo '# $project_name' > README.md"
-  if ! git add README.md 2>&1; then
+  local default_branch=$(git config --get init.defaultBranch 2>/dev/null || echo "main")
+  execute_safe "Initialize git repository" git -C "$dest_dir" init -b "$default_branch"
+  execute_safe "Create README.md" bash -c 'printf "# %s\n" "$2" > "$1"' _ "$dest_dir/README.md" "$project_name"
+
+  # Everything below writes git state; never run it in dry-run
+  if [[ "$DRY_RUN" == "true" ]]; then
+    preview_and_abort_if_dry
+    return 0
+  fi
+
+  # A fresh init has no remotes; keep the project isolated if any appear
+  remove_existing_remotes "$dest_dir" || echo -e "${YELLOW}Continuing with existing remotes.${NC}"
+
+  if ! git -C "$dest_dir" add README.md 2>&1; then
       echo -e "${RED}❌ Failed to add README.md${NC}" >&2
       return 1
   fi
-  if ! git commit -m "Initial commit" 2>&1; then
+  if ! git -C "$dest_dir" commit -m "Initial commit" 2>&1; then
       echo -e "${RED}❌ Failed to create initial commit${NC}" >&2
       return 1
   fi
@@ -1393,7 +1528,7 @@ convert_single_to_multi_platform() {
 
   # 2. Detect current platform from directory
   for platform in "${AVAILABLE_PLATFORMS[@]}"; do
-    if [[ "$source_dir" == "$REMOTE_ROOT/${PLATFORM_WORK_DIR[$platform]}"* ]]; then
+    if [[ "$source_dir" == "$REMOTE_ROOT/${PLATFORM_WORK_DIR[$platform]}/"* ]]; then
       current_platform="$platform"
       break
     fi
@@ -1403,8 +1538,12 @@ convert_single_to_multi_platform() {
   echo -e "${YELLOW}Current platform: $current_platform${NC}"
 
   # 3. Get current remote URL
-  cd "$source_dir" || return
-  local current_url=$(git remote get-url origin 2>/dev/null || git remote get-url "$current_platform" 2>/dev/null)
+  local current_url
+  current_url=$(git -C "$source_dir" remote get-url origin 2>/dev/null || git -C "$source_dir" remote get-url "$current_platform" 2>/dev/null)
+  if [[ -z "$current_url" ]]; then
+    echo -e "${RED}❌ Could not read the current remote URL for '$project_name'.${NC}"
+    return 1
+  fi
 
   echo -e "\n${BLUE}Current remote:${NC}"
   echo -e "  $current_url"
@@ -1463,44 +1602,57 @@ convert_single_to_multi_platform() {
     return 0
   fi
 
-  cd "$dest_dir" || {
-    echo -e "${RED}❌ Failed to change directory to '$dest_dir'.${NC}"
-    return 1
-  }
-
   # 7. Rename current remote (if it's "origin" or generic)
   echo -e "\n${BLUE}Configuring remotes...${NC}"
 
   # If remote is named "origin", rename to platform name
-  if git remote | grep -q "^origin$" && [[ -n "$current_platform" ]]; then
-    git remote rename origin "$current_platform"
-    echo -e "${GREEN}✓ Renamed remote: origin → $current_platform${NC}"
+  if git -C "$dest_dir" remote | grep -q "^origin$" && [[ -n "$current_platform" ]]; then
+    if git -C "$dest_dir" remote rename origin "$current_platform"; then
+      echo -e "${GREEN}✓ Renamed remote: origin → $current_platform${NC}"
+    else
+      echo -e "${YELLOW}⚠️  Could not rename origin → $current_platform (name may already be used).${NC}"
+    fi
   fi
 
-    # 8. Add additional remotes (skip first URL - it's the current one)
-    for ((i=1; i<${#urls[@]}; i++)); do
-        local url="${urls[$i]}"
-        local platform_name=""
+  # 8. Add additional remotes (skip first URL - it's the current one)
+  for ((i=1; i<${#urls[@]}; i++)); do
+      local url="${urls[$i]}"
+      local platform_name=""
 
-        # Detect platform from URL
-        platform_name=$(detect_platform_from_url "$url") || platform_name="remote$i"
+      # Detect platform from URL
+      platform_name=$(detect_platform_from_url "$url") || platform_name="remote$((i+1))"
 
-        # Skip if remote already exists
-    if ! git remote | grep -q "^$platform_name$"; then
-      git remote add "$platform_name" "$url"
-      echo -e "${GREEN}✓ Added remote: $platform_name${NC}"
-    fi
+      # Pick a free remote name instead of silently skipping duplicate platforms
+      local remote_name="$platform_name"
+      local suffix=2
+      while git -C "$dest_dir" remote | grep -qx "$remote_name"; do
+          remote_name="${platform_name}_${suffix}"
+          ((suffix++)) || true
+      done
+
+      if git -C "$dest_dir" remote add "$remote_name" "$url"; then
+          echo -e "${GREEN}✓ Added remote: $remote_name${NC}"
+      else
+          echo -e "${YELLOW}⚠️  Failed to add remote: $remote_name${NC}"
+      fi
   done
 
   # 9. Create multi-platform manifest
   echo -e "\n${YELLOW}Creating multi-platform manifest...${NC}"
 
-  # Build platform_urls array
+  # Build platform_urls array; use a unique key per URL so none are overwritten
   declare -A platform_urls
+  local manifest_key
   for url in "${urls[@]}"; do
-      local p
-      p=$(detect_platform_from_url "$url") || p="unknown"
-      platform_urls["$p"]="$url"
+      manifest_key=$(detect_platform_from_url "$url") || manifest_key="unknown"
+      if [[ -n "${platform_urls[$manifest_key]:-}" ]]; then
+          local n=2
+          while [[ -n "${platform_urls[${manifest_key}_${n}]:-}" ]]; do
+              ((n++)) || true
+          done
+          manifest_key="${manifest_key}_${n}"
+      fi
+      platform_urls["$manifest_key"]="$url"
   done
 
   create_multi_platform_manifest "$dest_dir" "$project_name" platform_urls "convert_single_to_multi"
@@ -1508,7 +1660,7 @@ convert_single_to_multi_platform() {
   # 10. Show status
   echo -e "\n${GREEN}✅ Successfully converted to multi-platform!${NC}"
   echo -e "Remotes:"
-  git remote -v
+  git -C "$dest_dir" remote -v
   echo -e "\n${YELLOW}Next steps:${NC}"
   echo "  - Run: git fetch --all"
   echo "  - Push to new remotes: git push --all"
@@ -1534,39 +1686,52 @@ convert_local_to_remote_workflow() {
   # Commit warning if any changes exist
   echo -e "\n${BLUE}=== Checking Repository Status ===${NC}"
 
-  # Fetch remote to get latest state
-  echo -e "${YELLOW}Fetching remote...${NC}"
-  if git -C "$source_dir" fetch --quiet 2>/dev/null; then
-    local remote_behind=0
-    local remote_ahead=0
-
-    # Check if local is behind/ahead of remote
-    if git -C "$source_dir" rev-list --left-right --count @{u}...HEAD 2>/dev/null | grep -qE '^[0-9]+ [0-9]+$'; then
-      remote_behind=$(git -C "$source_dir" rev-list --left-right --count @{u}...HEAD 2>/dev/null | cut -f1)
-      remote_ahead=$(git -C "$source_dir" rev-list --left-right --count @{u}...HEAD 2>/dev/null | cut -f2)
-    fi
-
-    # Show remote status
-    if [[ "$remote_behind" -gt 0 ]]; then
-      echo -e "${YELLOW}⚠️  Remote has $remote_behind new commit(s)${NC}"
-    fi
-    if [[ "$remote_ahead" -gt 0 ]]; then
-      echo -e "${YELLOW}⚠️  You have $remote_ahead local commit(s) not pushed${NC}"
-    fi
-    if [[ "$remote_behind" -eq 0 && "$remote_ahead" -eq 0 ]]; then
-      echo -e "${GREEN}✓ Local and remote are in sync${NC}"
-    fi
+  if ! check_local_exists "$source_dir"; then
+    echo -e "${YELLOW}⚠️  Not a git repository yet; it will be initialized during binding.${NC}"
   else
-    echo -e "${YELLOW}⚠️  Could not fetch remote${NC}"
-  fi
+    local -a status_remotes=()
+    mapfile -t status_remotes < <(git -C "$source_dir" remote 2>/dev/null)
 
-  # Show uncommitted changes
-  if git -C "$source_dir" diff --quiet 2>/dev/null && git -C "$source_dir" diff --cached --quiet 2>/dev/null; then
-    echo -e "${GREEN}✓ No uncommitted changes${NC}"
-  else
-    echo -e "${YELLOW}⚠️  Uncommitted changes present (will be preserved)${NC}"
-    echo -e "${YELLOW}Changes:${NC}"
-    git -C "$source_dir" diff --stat 2>/dev/null
+    if [[ ${#status_remotes[@]} -eq 0 ]]; then
+      echo -e "${YELLOW}⚠️  No remotes configured (local-only project); nothing to fetch.${NC}"
+    else
+      # Fetch remote to get latest state
+      echo -e "${YELLOW}Fetching remote...${NC}"
+      if git -C "$source_dir" fetch --quiet 2>/dev/null; then
+        # Only claim a comparison when the branch actually tracks a remote
+        # (rev-list separates the two counts with a tab, not a space)
+        if git -C "$source_dir" rev-list --left-right --count @{u}...HEAD 2>/dev/null | grep -qE '^[0-9]+[[:space:]]+[0-9]+$'; then
+          local remote_behind
+          local remote_ahead
+          remote_behind=$(git -C "$source_dir" rev-list --left-right --count @{u}...HEAD 2>/dev/null | cut -f1) || remote_behind=0
+          remote_ahead=$(git -C "$source_dir" rev-list --left-right --count @{u}...HEAD 2>/dev/null | cut -f2) || remote_ahead=0
+
+          # Show remote status
+          if [[ "$remote_behind" -gt 0 ]]; then
+            echo -e "${YELLOW}⚠️  Remote has $remote_behind new commit(s)${NC}"
+          fi
+          if [[ "$remote_ahead" -gt 0 ]]; then
+            echo -e "${YELLOW}⚠️  You have $remote_ahead local commit(s) not pushed${NC}"
+          fi
+          if [[ "$remote_behind" -eq 0 && "$remote_ahead" -eq 0 ]]; then
+            echo -e "${GREEN}✓ Local and remote are in sync${NC}"
+          fi
+        else
+          echo -e "${YELLOW}⚠️  Current branch has no upstream; remote state not compared.${NC}"
+        fi
+      else
+        echo -e "${YELLOW}⚠️  Could not fetch remote${NC}"
+      fi
+    fi
+
+    # Show uncommitted changes
+    if git -C "$source_dir" diff --quiet 2>/dev/null && git -C "$source_dir" diff --cached --quiet 2>/dev/null; then
+      echo -e "${GREEN}✓ No uncommitted changes${NC}"
+    else
+      echo -e "${YELLOW}⚠️  Uncommitted changes present (will be preserved)${NC}"
+      echo -e "${YELLOW}Changes:${NC}"
+      git -C "$source_dir" diff --stat 2>/dev/null
+    fi
   fi
 
   # === CHOOSE BINDING METHOD ===
@@ -1673,14 +1838,11 @@ convert_local_to_remote_workflow() {
     # It will handle: platform detection, SSH auth, and Smart destination logic.
     local cloned_dir
     cloned_dir=$(_clone_existing_remote "binding" "${urls[@]}")
-    cloned_dir=$(echo "$cloned_dir" | tail -n1 | tr -d '\r')
 
     if [[ -z "$cloned_dir" ]]; then
         echo -e "${RED}❌ Clone failed or was cancelled.${NC}"
         return 1
     fi
-
-    echo -e "${GREEN}✅ Cloned to $cloned_dir${NC}"
 
     # CRITICAL: The cloned directory path is now in $cloned_dir.
     # Set $dest_dir to this value for any later logic that expects it.
@@ -1727,9 +1889,11 @@ convert_local_to_remote_workflow() {
         if [[ "$commit_choice" =~ ^[Yy]$ ]]; then
             read -rp "Commit message: " commit_msg
             [[ -z "$commit_msg" ]] && commit_msg="Merge local changes from $project_name"
-            git add .
-            git commit -m "$commit_msg"
-            echo -e "${GREEN}✓ Changes committed${NC}"
+            if git -C "$dest_dir" add -A && git -C "$dest_dir" commit -m "$commit_msg"; then
+                echo -e "${GREEN}✓ Changes committed${NC}"
+            else
+                echo -e "${YELLOW}⚠️  Commit failed. Files are in place; run 'git add -A && git commit' manually.${NC}"
+            fi
         else
             echo -e "${YELLOW}⚠️  Changes not committed. Run 'git add . && git commit' when ready.${NC}"
         fi
@@ -1773,6 +1937,11 @@ convert_local_to_remote_workflow() {
         echo -e "Location: $dest_dir"
         echo -e "${YELLOW}Remotes available:${NC}"
         git remote -v
+
+        # Offer to reconcile branches now that local and remote are connected
+        if [[ "$DRY_RUN" != "true" ]] && confirm_action "Synchronize '$project_name' with 'origin' now?" "y"; then
+            ( sync_with_remote origin "$first_url" ) || echo -e "${YELLOW}Synchronization skipped.${NC}"
+        fi
 
         cd - >/dev/null
         return 0
@@ -1836,9 +2005,11 @@ convert_local_to_remote_workflow() {
     if [[ "$commit_choice" =~ ^[Yy]$ ]]; then
       read -rp "Commit message: " commit_msg
       [[ -z "$commit_msg" ]] && commit_msg="Initial commit with local changes from $project_name"
-      git add .
-      git commit -m "$commit_msg"
-      echo -e "${GREEN}✅ Changes committed${NC}"
+      if git -C "$dest_dir" add -A && git -C "$dest_dir" commit -m "$commit_msg"; then
+        echo -e "${GREEN}✅ Changes committed${NC}"
+      else
+        echo -e "${YELLOW}⚠️  Commit failed. Files are in place; run 'git add -A && git commit' manually.${NC}"
+      fi
     else
       echo -e "${YELLOW}⚠️  Changes not committed. Run 'git add . && git commit' when ready.${NC}"
     fi
@@ -1887,6 +2058,15 @@ convert_local_to_remote_workflow() {
         platform_urls["$platform"]=$(git remote get-url "$platform" 2>/dev/null || echo "")
       done
       create_multi_platform_manifest "$dest_dir" "$project_name" platform_urls "convert_local_to_remote"
+    elif [[ ${#platform_array[@]} -eq 1 ]]; then
+      # Single platform: offer to reconcile the branches we just connected
+      local sync_platform="${platform_array[0]}"
+      local sync_url
+      sync_url=$(git remote get-url "$sync_platform" 2>/dev/null || echo "")
+      if [[ -n "$sync_url" && "$DRY_RUN" != "true" ]] && \
+         confirm_action "Synchronize '$project_name' with '$sync_platform' now?" "y"; then
+        ( sync_with_remote "$sync_platform" "$sync_url" ) || echo -e "${YELLOW}Synchronization skipped.${NC}"
+      fi
     fi
 
   fi
@@ -1987,7 +2167,7 @@ list_remote_repos_workflow() {
     # FIXED: Proper array handling for multiple platforms
     local -a platforms
     mapfile -t platforms < <(select_platforms "Choose platform(s) to list:" "true")
-    if [[ $? -ne 0 ]] || [[ ${#platforms[@]} -eq 0 ]]; then
+    if [[ ${#platforms[@]} -eq 0 ]]; then
         echo -e "${YELLOW}Cancelled.${NC}"
         return
     fi
@@ -2017,7 +2197,7 @@ list_remote_repos_workflow() {
         echo -e "\n${RED}❌ No repositories could be listed.${NC}"
     fi
     printf "\n" >&2
-    read -rp $'\n'"Press Enter to continue..." -n 1
+    read -rp $'\n'"Press Enter to continue..." -n 1 || true
 }
 
 
@@ -2171,6 +2351,59 @@ _delete_both() {
 
 # =================================  GITIGNORE WORKFLOW ====================================
 # Standalone gitignore maker with flexible pattern sources
+# Append the built-in generic ignore patterns
+_append_generic_patterns() {
+    local ignore_file="$1"
+    cat >> "$ignore_file" << 'EOF'
+
+# ==================== GENERIC PATTERNS ====================
+# Operating System
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editors and IDEs
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-*
+
+# Build and package artifacts
+dist/
+build/
+out/
+target/
+bin/
+obj/
+*.min.*
+*.map
+coverage/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+logs/
+tmp/
+temp/
+
+# Environment and credentials
+.env
+.env.*
+secrets.json
+credentials.json
+api_keys.*
+EOF
+}
+
 gitignore_maker() {
     local project_dir="$1"
     local mode="${2:-standalone}"  # "first-push" or "standalone"
@@ -2268,69 +2501,24 @@ gitignore_maker() {
 
     case "$source_choice" in
         1) # Generic patterns only
-            cat >> "$ignore_file" << 'EOF'
-
-# ==================== GENERIC PATTERNS ====================
-# Operating System
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-Desktop.ini
-$RECYCLE.BIN/
-
-# Editors and IDEs
-*.swp
-*.swo
-*~
-.idea/
-.vscode/
-*.sublime-*
-
-# Build and package artifacts
-dist/
-build/
-out/
-target/
-bin/
-obj/
-*.min.*
-*.map
-coverage/
-
-# Logs and temporary files
-*.log
-*.tmp
-*.temp
-logs/
-tmp/
-temp/
-
-# Environment and credentials
-.env
-.env.*
-secrets.json
-credentials.json
-api_keys.*
-EOF
+            _append_generic_patterns "$ignore_file"
             echo -e "${GREEN}✓ Added generic patterns${NC}"
             ;;
 
         2) # Fetch from GitHub gitignore templates
             if ! command -v curl &>/dev/null; then
                 echo -e "${YELLOW}⚠️  curl not installed. Using generic patterns instead.${NC}"
-                source_choice=1
+                _append_generic_patterns "$ignore_file"
+                echo -e "${GREEN}✓ Added generic patterns${NC}"
             else
                 echo -e "\n${BLUE}Fetching available templates from GitHub...${NC}"
                 local templates
-                templates=$(curl -s https://api.github.com/repos/github/gitignore/contents | jq -r '.[] | select(.type=="file") | .name' | sed 's/\.gitignore$//')
+                templates=$(curl -fsS https://api.github.com/repos/github/gitignore/contents 2>/dev/null | jq -r '.[] | select(.type=="file") | .name' 2>/dev/null | sed 's/\.gitignore$//' || true)
 
                 if [[ -z "$templates" ]]; then
                     echo -e "${YELLOW}⚠️  Failed to fetch templates. Using generic patterns instead.${NC}"
-                    source_choice=1
+                    _append_generic_patterns "$ignore_file"
+                    echo -e "${GREEN}✓ Added generic patterns${NC}"
                 else
                     echo -e "\n${BLUE}Select templates to include (space-separated numbers):${NC}"
                     echo "  0) None (skip template selection)"
@@ -2357,10 +2545,17 @@ EOF
                                 template_name=$(echo "$templates" | sed -n "${num}p")
                                 if [[ -n "$template_name" ]]; then
                                     echo -e "\n${BLUE}Fetching $template_name template...${NC}"
-                                    echo "" >> "$ignore_file"
-                                    echo "# --- $template_name ---" >> "$ignore_file"
-                                    curl -s "https://raw.githubusercontent.com/github/gitignore/main/${template_name}.gitignore" >> "$ignore_file"
-                                    echo -e "${GREEN}✓ Added $template_name patterns${NC}"
+                                    local template_body
+                                    if template_body=$(curl -fsS "https://raw.githubusercontent.com/github/gitignore/main/${template_name}.gitignore" 2>/dev/null); then
+                                        {
+                                            echo ""
+                                            echo "# --- $template_name ---"
+                                            printf '%s\n' "$template_body"
+                                        } >> "$ignore_file"
+                                        echo -e "${GREEN}✓ Added $template_name patterns${NC}"
+                                    else
+                                        echo -e "${YELLOW}⚠️  Failed to fetch $template_name; skipped.${NC}"
+                                    fi
                                 fi
                             fi
                         done
@@ -2397,14 +2592,14 @@ EOF
     case "$mode_choice" in
         1) # Commit to repository
             echo -e "\n${BLUE}Committing .gitignore changes...${NC}"
-            cd "$project_dir" || return 1
 
-            if git add ".gitignore"; then
-                if git commit -m "Add/update .gitignore patterns"; then
+            if git -C "$project_dir" add ".gitignore"; then
+                if git -C "$project_dir" commit -m "Add/update .gitignore patterns"; then
                     echo -e "${GREEN}✓ Successfully committed .gitignore${NC}"
                 else
                     echo -e "${YELLOW}⚠️  Commit failed. Changes staged but not committed.${NC}"
                     echo -e "${YELLOW}Run 'git commit -m \"Add .gitignore\"' to complete.${NC}"
+                    return 1
                 fi
             else
                 echo -e "${RED}❌ Failed to stage .gitignore${NC}"
@@ -2438,12 +2633,13 @@ EOF
             ;;
 
         *)
-            echo -e "${YELLOW}Cancelled.${NC}"
+            echo -e "${YELLOW}Cancelled. Patterns were written to .gitignore but nothing was committed.${NC}"
             return 1
             ;;
     esac
 
-    # Create template file for documentation
+    # Create template file for documentation (only when committing)
+    if [[ "$strategy" == "normal" ]]; then
     cat > "$project_dir/.gitignore.template" << 'EOF'
 # ==================== GITIGNORE TEMPLATE ====================
 # This file is for reference only. Copy patterns to .gitignore as needed.
@@ -2480,6 +2676,7 @@ EOF
 # consider using .git/info/exclude (local-only) instead.
 EOF
     echo -e "${GREEN}✓ Created .gitignore.template for reference${NC}"
+    fi
 
     # Return strategy for caller
     if [[ "$strategy" == "exclude" ]]; then
@@ -2549,18 +2746,20 @@ handle_existing_remote() {
 
 # Helper: Check and remove any existing remotes (for local-only projects)
 remove_existing_remotes() {
+    local dir="${1:-.}"
     local remotes
-    remotes=$(git remote 2>/dev/null)
+    remotes=$(git -C "$dir" remote 2>/dev/null)
 
     if [[ -n "$remotes" ]]; then
         echo ""
         echo -e "${YELLOW}⚠️  Existing remotes detected in this local project:${NC}"
-        git remote -v
+        git -C "$dir" remote -v
 
         if confirm_action "Remove all remotes to make project truly local-only?" "n" "Remove remotes"; then
-            git remote | while read -r remote; do
-                execute_dangerous "Remove remote $remote" git remote remove "$remote"
-            done
+            local remote
+            while read -r remote; do
+                execute_dangerous "Remove remote $remote" git -C "$dir" remote remove "$remote"
+            done <<< "$remotes"
             return 0
         else
             echo -e "${YELLOW}⚠️  Keeping existing remotes (not truly local-only)${NC}"
@@ -2682,7 +2881,7 @@ gitignore_maker_interactive() {
   local dir
   dir=$(_select_project_from_dir "$PROJECT_ROOT" "Select project for .gitignore:") || return 1
   [[ -n "$dir" ]] || return 1
-  gitignore_maker "$dir" "standalone"
+  gitignore_maker "$dir" "standalone" || true
 }
 
 
@@ -2823,19 +3022,36 @@ _select_project_from_dir() {
     local exclude_dir="${3:-}"
     local projects=()
 
+    # Resolve the root once so prefix checks compare canonical paths
+    local root_canon
+    root_canon=$(realpath -e "$root_dir" 2>/dev/null) || root_canon="$root_dir"
+
+    local local_root_canon
+    local_root_canon=$(realpath -e "$LOCAL_ROOT" 2>/dev/null) || local_root_canon="$LOCAL_ROOT"
+
     # Find all project directories
-    if [[ "$root_dir" == "$LOCAL_ROOT" ]]; then
+    if [[ "$root_canon" == "$local_root_canon" ]]; then
         # Local projects: flat structure
         while IFS= read -r p; do
-            projects+=("$p")
-        done < <(find "$root_dir" -maxdepth 1 -mindepth 1 -type d ! -name ".*" 2>/dev/null | sort)
+            local p_canon
+            p_canon=$(realpath -e "$p" 2>/dev/null) || continue
+            [[ "$p_canon" == "$root_canon/"* ]] || continue
+            projects+=("$p_canon")
+        done < <(find "$root_canon" -maxdepth 1 -mindepth 1 -type d ! -name ".*" 2>/dev/null | sort)
     else
         # Remote projects: find directories with .git
-        local find_args=("$root_dir")
-        [[ -n "$exclude_dir" ]] && find_args+=(-path "$exclude_dir" -prune -o)
+        local find_args=("$root_canon")
+        if [[ -n "$exclude_dir" ]]; then
+            local exclude_canon
+            exclude_canon=$(realpath -e "$exclude_dir" 2>/dev/null) || exclude_canon="$exclude_dir"
+            find_args+=(-path "$exclude_canon" -prune -o)
+        fi
         find_args+=(-type d -name ".git" -print)
         while IFS= read -r git_dir; do
-            projects+=("$(dirname "$git_dir")")
+            local repo_canon
+            repo_canon=$(realpath -e "$(dirname "$git_dir")" 2>/dev/null) || continue
+            [[ "$repo_canon" == "$root_canon/"* ]] || continue
+            projects+=("$repo_canon")
         done < <(find "${find_args[@]}" 2>/dev/null)
     fi
 
@@ -2908,17 +3124,6 @@ _select_project_from_dir() {
     done
 }
 
-# Before destructive actions, show exactly what will happen
-# Preview action without executing
-preview_action() {
-    echo -e "${BLUE}📋 Action Preview:${NC}"
-    echo "  Command: $*"
-    echo "  Working dir: $(pwd)"
-    local changes=$(git status --short 2>/dev/null | wc -l)
-    echo "  Git status: $changes changes"
-    return 0
-}
-
 show_about() {
     clear
     echo -e "${BLUE}╔══════════════════════════════════════╗${NC}"
@@ -2939,7 +3144,7 @@ show_about() {
     echo "For support, contact: dharrunsingh@gmail.com"
     echo ""
     echo "For Troubleshooting visit my repo for Documentations"
-    read -rp "Press Enter to return to menu..."
+    read -rp "Press Enter to return to menu..." || true
 }
 
 # ======================= EXECUTION HELPERS ==========================
@@ -2948,6 +3153,27 @@ show_about() {
 execute_dangerous() {
     local description="$1"
     shift
+
+    # Filesystem-destructive commands may only touch paths under PROJECT_ROOT
+    local cmd="${1:-}"
+    if [[ "$cmd" == "rm" || "$cmd" == "mv" ]]; then
+        local -a path_args=()
+        local arg
+        for arg in "${@:2}"; do
+            [[ "$arg" == -* ]] && continue
+            path_args+=("$arg")
+        done
+        if [[ ${#path_args[@]} -eq 0 ]]; then
+            echo -e "${RED}❌ Refusing '$cmd' with no target.${NC}"
+            return 1
+        fi
+        for arg in "${path_args[@]}"; do
+            if ! _is_under_project_root "$arg"; then
+                echo -e "${RED}❌ Refusing to $cmd outside $PROJECT_ROOT: $arg${NC}"
+                return 1
+            fi
+        done
+    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
         echo -e "${YELLOW}┌─────────────────────────────────────┐${NC}"
@@ -2990,11 +3216,11 @@ confirm_action() {
 
     echo -e "${YELLOW}⚠️  $message${NC}"
     if [[ "$default" == "y" ]]; then
-        read -rp "Proceed? (Y/n): " -n 1
+        read -rp "Proceed? (Y/n): " -n 1 || { echo; return 1; }
         echo
         [[ ! $REPLY =~ ^[Nn]$ ]]
     else
-        read -rp "Proceed? (y/N): " -n 1
+        read -rp "Proceed? (y/N): " -n 1 || { echo; return 1; }
         echo
         [[ $REPLY =~ ^[Yy]$ ]]
     fi
@@ -3002,6 +3228,22 @@ confirm_action() {
 
 
 # ======================= MAIN MENU & ENTRY POINT =============================
+
+# Run a menu action in a subshell; a non-zero result returns to the menu.
+# The explicit `set -e` inside keeps failures aborting the action at the point
+# they happen, instead of being suppressed by a `||` context.
+run_menu_action() {
+    local rc=0
+    set +e
+    ( set -e; "$@" )
+    rc=$?
+    set -e
+    if [[ $rc -ne 0 ]]; then
+        echo -e "\n${YELLOW}Returned to menu.${NC}"
+        sleep 1
+    fi
+}
+
 main_menu() {
     while true; do
         clear
@@ -3035,15 +3277,15 @@ main_menu() {
         read -rp "Select (0-9): " choice
 
         case $choice in
-            1) create_new_project_workflow ;;
-            2) convert_single_to_multi_platform ;;
-            3) convert_local_to_remote_workflow ;;
-            4) convert_remote_to_local_workflow ;;
-            5) manage_project_workflow ;;
-            6) list_remote_repos_workflow ;;
-            7) gitignore_maker_interactive ;;
-            8) test_platform_config ;;
-            9) show_about ;;
+            1) run_menu_action create_new_project_workflow ;;
+            2) run_menu_action convert_single_to_multi_platform ;;
+            3) run_menu_action convert_local_to_remote_workflow ;;
+            4) run_menu_action convert_remote_to_local_workflow ;;
+            5) run_menu_action manage_project_workflow ;;
+            6) run_menu_action list_remote_repos_workflow ;;
+            7) run_menu_action gitignore_maker_interactive ;;
+            8) run_menu_action test_platform_config ;;
+            9) run_menu_action show_about ;;
             0) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
             *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
