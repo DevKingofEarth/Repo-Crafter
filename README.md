@@ -2,7 +2,7 @@
 
 > [!CAUTION]
 > This script manages Git repositories and makes API calls to platforms. Please review the code thoroughly before use.
-> **Configure tokens in** `~/.config/repo-crafter/platforms.conf` **or environment variables.**
+> **Configure tokens as environment variables** (for example `GITHUB_API_TOKEN`), as named by `token_var` in `~/.config/repo-crafterFiles/platforms.conf`.
 
 The README.md would be gradually edited and updated.
 
@@ -17,7 +17,7 @@ This is an interactive script to manage your projects may it be local, cloned or
 
 - Code Documentation : for debugging or easy understanding of script
 - User Manual : to understand and ease of use for Interactions with the script.
-- Also refer `~/.config/repo-crafter/platforms.conf` for your setup.
+- Also refer `~/.config/repo-crafterFiles/platforms.conf` for your setup; tokens themselves are read from the environment variables it names.
 - View below diagrams for easy visualization, but there might be mistakes, which will also be resolved gradually.
 
 2. Prequisites of knowledge

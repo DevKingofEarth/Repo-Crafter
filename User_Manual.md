@@ -592,7 +592,7 @@ repo-crafter
 **Menu Navigation**:
 1. Select `4) 🗑️  Manage/Delete Project`
 2. Choose option:
-   - `1) Delete local copy` (keeps remote repo)
+   - `1) Delete local files` (bound remotes are kept; a local-only project is deleted permanently)
    - `2) Unbind from remote` (keeps local, moves to `Local_Projects/`)
    - `3) Delete BOTH` (TYPE PROJECT NAME TO CONFIRM)
 3. Select project
@@ -602,6 +602,8 @@ repo-crafter
 - This prevents accidental deletions from typos or muscle memory
 ⚠️ **DANGER**: This permanently deletes remote repository and ALL local files
 No recovery possible - this is an irreversible operation
+
+> Option 3 lists single-platform projects only. `Multi-server` projects hold several remotes and must be removed manually for now.
 
 ---
 
