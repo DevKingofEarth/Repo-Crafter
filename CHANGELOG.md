@@ -2,7 +2,7 @@
 
 All notable changes to Repo-Crafter will be documented in this file.
 
-## [fix/tier0] - 2026-11-07
+## [1.2.0-beta] - 2026-11-10
 
 ### Fixed
 - Startup crash: `PLATFORM_REPO_DELETE_METHOD` was written by the config parser but never declared, so `set -u` failed on `github: unbound variable`

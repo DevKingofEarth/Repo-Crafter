@@ -31,7 +31,7 @@ set -euo pipefail
 FORBIDDEN_DIRS=("/etc" "/root" "/bin" "/sbin" "/usr")
 
 # Single source of truth for the reported version
-SCRIPT_VERSION="1.1.2-beta"
+SCRIPT_VERSION="1.2.0-beta"
 
 # Path variables
 PROJECT_ROOT="$HOME/Projects"
