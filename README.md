@@ -18,6 +18,7 @@ This is an interactive script to manage your projects may it be local, cloned or
 - Code Documentation : for debugging or easy understanding of script
 - User Manual : to understand and ease of use for Interactions with the script.
 - Also refer `~/.config/repo-crafterFiles/platforms.conf` for your setup; tokens themselves are read from the environment variables it names.
+- Every bound project gets `repo-crafter.yml`, a human-owned manifest of the intended remotes. Commit it. Menu option `10` checks it against `git remote -v`.
 - View below diagrams for easy visualization, but there might be mistakes, which will also be resolved gradually.
 
 2. Prequisites of knowledge
@@ -52,6 +53,7 @@ flowchart TD
         M7[⚙️ Configure .gitignore]
         M8[🧪 Test Configuration]
         M9[ℹ️ About this script]
+        M10[🧾 Project Manifest]
         M0[🚪 Exit]
     end
 

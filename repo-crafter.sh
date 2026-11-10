@@ -30,6 +30,9 @@ set -euo pipefail
 # Restricted directories
 FORBIDDEN_DIRS=("/etc" "/root" "/bin" "/sbin" "/usr")
 
+# Single source of truth for the reported version
+SCRIPT_VERSION="1.1.2-beta"
+
 # Path variables
 PROJECT_ROOT="$HOME/Projects"
 LOCAL_ROOT="$PROJECT_ROOT/Local_Projects"
@@ -244,11 +247,11 @@ select_platforms() {
             fi
             IFS=',' read -ra selected_indices <<< "$multi_input"
             for idx in "${selected_indices[@]}"; do
-                local valid_idx=$((idx-1))
                 if [[ ! "$idx" =~ ^[0-9]+$ ]]; then
                     echo -e "${RED}Invalid selection. Enter a number.${NC}" >&2
                     continue
                 fi
+                local valid_idx=$((idx-1))
                 if [[ $valid_idx -lt 0 || $valid_idx -ge ${#AVAILABLE_PLATFORMS[@]} ]]; then
                     echo -e "${RED}Invalid selection. Choose 1-${#AVAILABLE_PLATFORMS[@]}.${NC}" >&2
                     continue
@@ -272,6 +275,10 @@ select_platforms() {
         fi
     else
         # Single selection mode
+        if [[ ! "$input" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}Invalid selection. Enter a number.${NC}" >&2
+            return 1
+        fi
         idx=$((input-1))
         if [[ $idx -ge 0 && $idx -lt ${#AVAILABLE_PLATFORMS[@]} ]]; then
             choices+=("${AVAILABLE_PLATFORMS[$idx]}")
@@ -394,6 +401,23 @@ check_ssh_auth() {
     fi
 }
 
+# Validate a git remote URL or path: only https://, git@host:…, or local
+# filesystem paths are accepted. This closes option-injection primitives
+# (e.g. --upload-pack=…) and prevents other transports (ext::, file://,
+# ssh:// with options) from reaching git clone / git ls-remote /
+# git remote add.
+# Returns: 0 valid, 1 invalid.
+_validate_git_url() {
+  local url="$1"
+  [[ -n "$url" ]] || return 1
+  # Reject anything starting with '-' (option injection) outright.
+  [[ "$url" == -* ]] && return 1
+  case "$url" in
+    https://*|git@*:*|/*|./*|../*) return 0 ;;
+  esac
+  return 1
+}
+
 # Validate and sanitize project names to prevent injection attacks
 validate_project_name() {
     local name="$1"
@@ -402,6 +426,14 @@ validate_project_name() {
     # Check if empty
     if [[ -z "$name" ]]; then
         echo -e "${RED}❌ $purpose cannot be empty${NC}" >&2
+        return 1
+    fi
+
+    # Reject leading dashes and dots: the name may reach git as an argument
+    # and could be parsed as a flag (e.g. `-rf`, `--help`).
+    if [[ "$name" == -* || "$name" == .* ]]; then
+        echo -e "${RED}❌ $purpose cannot start with '-' or '.'${NC}" >&2
+        echo -e "${YELLOW}Only use: a-z, A-Z, 0-9, -, _ (must not start with - or .)${NC}" >&2
         return 1
     fi
 
@@ -544,7 +576,8 @@ warn_duplicate_remote_connections() {
 
     while IFS= read -r git_dir; do
         local repo_dir=$(dirname "$git_dir")
-        local remote_url=$(cd "$repo_dir" && git remote get-url origin 2>/dev/null || git remote get-url github 2>/dev/null || echo "")
+        local remote_url
+        remote_url=$(git -C "$repo_dir" remote get-url origin 2>/dev/null || git -C "$repo_dir" remote get-url github 2>/dev/null || echo "")
 
         if [[ -n "$remote_url" ]]; then
             remote_map["$remote_url"]+="|$repo_dir"
@@ -562,7 +595,7 @@ warn_duplicate_remote_connections() {
                 echo -e "${YELLOW}⚠️  WARNING${NC}"
                 duplicate_found=1
             fi
-            echo -e "${YELLOW}  Remote: $url${NC}"
+            echo -e "${YELLOW}  Remote: $(_redact_url_credentials "$url")${NC}"
             echo "$paths" | tr '|' '\n' | grep -v "^$" | while IFS= read -r path; do
                 echo -e "    -> $path"
             done
@@ -662,28 +695,34 @@ platform_api_call() {
 #     echo -e "${YELLOW}[DEBUG] Token preview (safe): $safe_token_preview${NC}" >&2
 #     echo -e "${YELLOW}[DEBUG] Final auth header: $auth_header_name: ${auth_header_value:0:15}...${NC}" >&2
 
+    # Keep the token out of the process command line: curl reads the auth
+    # header from a 0600 file. argv (and therefore ps/proc) only sees the path.
+    auth_header_name="${auth_header_name//$'\r'/}"
+    auth_header_name="${auth_header_name//$'\n'/}"
+    auth_header_value="${auth_header_value//$'\r'/}"
+    auth_header_value="${auth_header_value//$'\n'/}"
+
+    local header_file=""
+    header_file=$(mktemp "${TMPDIR:-/tmp}/repo-crafter-hdr.XXXXXX") || {
+        echo -e "${RED}❌ Could not create a temporary auth header file${NC}" >&2
+        return 1
+    }
+    chmod 600 "$header_file" 2>/dev/null || true
+    if ! printf '%s: %s\n' "$auth_header_name" "$auth_header_value" > "$header_file"; then
+        rm -f "$header_file"
+        echo -e "${RED}❌ Could not write the temporary auth header file${NC}" >&2
+        return 1
+    fi
+
     # ADD TO CURL ARGS
-    curl_args+=(-H "$auth_header_name: $auth_header_value")
+    curl_args+=(-H "@$header_file")
 
     [[ -n "$data" ]] && curl_args+=(-d "$data")
 
-    # DEBUG: Show curl command (token half-masked for security)
+    # DEBUG: Show the request. The token is in the header file, never in argv.
     if [[ "$DEBUG_MODE" == "true" ]]; then
         echo -e "${YELLOW}[DEBUG] API Call: ${NC}" >&2
-        local masked_args=("${curl_args[@]}")
-        for i in "${!masked_args[@]}"; do
-            if [[ "${masked_args[i]}" =~ ^Authorization:.*Bearer\ (.+)$ ]]; then
-                local full_token="${BASH_REMATCH[1]}"
-                local token_len=${#full_token}
-                if [[ $token_len -gt 10 ]]; then
-                    local masked_token="${full_token:0:4}...${full_token: -4}"
-                else
-                    masked_token="***"
-                fi
-                masked_args[i]="Authorization: Bearer $masked_token"
-            fi
-        done
-        echo "curl ${masked_args[*]} \"${api_base}${endpoint}\"" >&2
+        echo "curl ${curl_args[*]} \"${api_base}${endpoint}\"" >&2
     fi
 
     # Execute with retries
@@ -694,8 +733,9 @@ platform_api_call() {
         local http_code="${response##*$'\n'}"
         local body="${response%$'\n'*}"
 
-        # Handle success
-        if [[ "$http_code" =~ ^(200|201|204)$ ]]; then
+        # 202 is GitLab's documented response for an accepted project delete.
+        if [[ "$http_code" =~ ^(200|201|202|204)$ ]]; then
+            rm -f "$header_file"
             echo "$body"
             return 0
         fi
@@ -703,10 +743,12 @@ platform_api_call() {
         # Handle errors
         case "$http_code" in
             401)
+                rm -f "$header_file"
                 echo -e "${RED}❌ Authentication failed for $platform${NC}" >&2
                 return 1
                 ;;
             403|404)
+                rm -f "$header_file"
                 echo -e "${RED}❌ Error $http_code from $platform${NC}" >&2
                 echo -e "${YELLOW}Possible causes:${NC}" >&2
                 echo -e "  • Token lacks required permissions (need 'repo' scope for GitHub)" >&2
@@ -721,6 +763,7 @@ platform_api_call() {
                     sleep $retry_delay
                     ((retry_delay *= 2))
                 else
+                    rm -f "$header_file"
                     echo -e "${RED}❌ API call failed after $max_retries attempts${NC}" >&2
                     return 1
                 fi
@@ -728,6 +771,7 @@ platform_api_call() {
         esac
         ((attempt++))
     done
+    rm -f "$header_file"
     return 1
 }
 
@@ -804,13 +848,10 @@ create_remote_repo() {
     local api_user_name
     if api_user_name=$(get_authenticated_user "$platform"); then
         user_name="$api_user_name"
-        echo -e "${BLUE}Using authenticated user: $user_name${NC}"
+        echo -e "${BLUE}Using authenticated user: $user_name${NC}" >&2
     else
-        echo -e "${YELLOW}⚠️  Falling back to provided username: $user_name${NC}"
+        echo -e "${YELLOW}⚠️  Falling back to provided username: $user_name${NC}" >&2
     fi
-
-    # DEBUG: Show loaded template from array
-    echo "[DEBUG] Template from array: '${PLATFORM_PAYLOAD_TEMPLATE[$platform]}'" >&2
 
     # 2. Get template - use direct assignment to avoid bash brace interpretation
     local template
@@ -820,15 +861,9 @@ create_remote_repo() {
         template='{"name":"{repo}"}'
     fi
 
-    # DEBUG: Show raw template
-    echo "[DEBUG] Raw template: $template" >&2
-
     # 3. Simple placeholder replacement (your complex logic breaks things)
     template="${template//\{repo\}/$(printf '%s' "$repo_name" | jq -sRr @uri)}"
     template="${template//\{owner\}/$(printf '%s' "$user_name" | jq -sRr @uri)}"
-
-    # DEBUG: Show template after replacement
-    echo "[DEBUG] After replacement: $template" >&2
 
     # Handle {private} placeholder only
     if [[ "$visibility" == "private" ]]; then
@@ -837,13 +872,10 @@ create_remote_repo() {
         template="${template//\{private\}/false}"
     fi
 
-    # DEBUG: Show final template
-    echo "[DEBUG] Final template: $template" >&2
-
     # Clean up any unused placeholders
     template="${template//\{private\}/}"
 
-    echo -n "Creating repository on $platform... "
+    echo -n "Creating repository on $platform... " >&2
 
     # Send request
     local response
@@ -851,10 +883,10 @@ create_remote_repo() {
 
     # 4. Error handling with configurable patterns
     if [[ $? -ne 0 ]] || [[ -z "$response" ]]; then
-        echo -e "${RED}❌ API failed${NC}"
+        echo -e "${RED}❌ API failed${NC}" >&2
 
         local error_msg=$(echo "$response" | jq -r '.message // .error // "Unknown error"' 2>/dev/null || echo "$response")
-        echo -e "${YELLOW}Error: ${error_msg:0:100}...${NC}"
+        echo -e "${YELLOW}Error: ${error_msg:0:100}...${NC}" >&2
 
         # Check if error matches configurable patterns
         local patterns="${PLATFORM_OWNER_NOT_FOUND_PATTERNS[$platform]}"
@@ -871,13 +903,13 @@ create_remote_repo() {
         fi
 
         if [[ "$should_fallback" == "true" ]]; then
-            echo -e "${YELLOW}⚠️  Owner '$user_name' not found. Trying authenticated user...${NC}"
+            echo -e "${YELLOW}⚠️  Owner '$user_name' not found. Trying authenticated user...${NC}" >&2
             # ... rest of fallback logic from your original function ...
         else
             return 1
         fi
     else
-        echo -e "${GREEN}✅ Created${NC}"
+        echo -e "${GREEN}✅ Created${NC}" >&2
     fi
 
     # 5. Extract SSH URL using configurable fields
@@ -925,6 +957,13 @@ sync_with_remote() {
     local current_branch="${3:-}"
     local dry_run_mode="${DRY_RUN:-false}"  # Use global DRY_RUN if available
 
+    # Reject option-injection / non-standard transports before git sees the URL.
+    _validate_git_url "$remote_url" || {
+        echo -e "${RED}❌ Invalid remote URL: '$remote_url'${NC}" >&2
+        echo -e "${YELLOW}   Only https://… or git@host:… URLs are accepted.${NC}" >&2
+        return 1
+    }
+
     # Get current branch if not provided
     if [[ -z "$current_branch" ]]; then
         current_branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
@@ -934,15 +973,20 @@ sync_with_remote() {
         fi
     fi
 
+    # If this project has a manifest, report drift before changing anything.
+    if [[ -f "repo-crafter.yml" ]]; then
+        manifest_reconcile "$PWD" "true" || true
+    fi
+
     echo -e "\n${BLUE}╔══════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║       SYNCHRONIZATION PHASE           ║${NC}"
+    echo -e "${BLUE}║       FETCH & INTEGRATION             ║${NC}"
     echo -e "${BLUE}╚══════════════════════════════════════╝${NC}"
 
     # Check remote accessibility with timeout
     echo -n "Checking remote accessibility... "
     # A reachable but empty repository exits non-zero with --exit-code, so do
     # not use it here: an empty remote is exactly what a new repo looks like.
-    if timeout 5 git ls-remote "$remote_url" &>/dev/null; then
+    if timeout 5 git ls-remote -- "$remote_url" &>/dev/null; then
         echo -e "${GREEN}✓ Accessible${NC}"
     else
         echo -e "${RED}✗ Cannot access remote${NC}"
@@ -967,20 +1011,19 @@ sync_with_remote() {
     mapfile -t local_branches < <(git for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null | sort)
     mapfile -t remote_branches < <(git for-each-ref --format='%(refname:lstrip=3)' "refs/remotes/$platform/" 2>/dev/null | grep -v '^HEAD$' | sort)
 
-    local b rb found
+    local -A local_set=() remote_set=()
+    local b rb
     for b in "${local_branches[@]}"; do
-        found=false
-        for rb in "${remote_branches[@]}"; do
-            [[ "$b" == "$rb" ]] && { found=true; break; }
-        done
-        [[ "$found" == "true" ]] || local_only+=("$b")
+        local_set["$b"]=1
     done
     for rb in "${remote_branches[@]}"; do
-        found=false
-        for b in "${local_branches[@]}"; do
-            [[ "$b" == "$rb" ]] && { found=true; break; }
-        done
-        [[ "$found" == "true" ]] || remote_only+=("$rb")
+        remote_set["$rb"]=1
+    done
+    for b in "${local_branches[@]}"; do
+        [[ -n "${remote_set[$b]:-}" ]] || local_only+=("$b")
+    done
+    for rb in "${remote_branches[@]}"; do
+        [[ -n "${local_set[$rb]:-}" ]] || remote_only+=("$rb")
     done
 
     echo -e "\n${BLUE}Branch inventory:${NC}"
@@ -990,7 +1033,7 @@ sync_with_remote() {
 
     # Never rename branches; just report a different remote default
     local remote_default
-    remote_default=$(git ls-remote --symref "$remote_url" HEAD 2>/dev/null | \
+    remote_default=$(git ls-remote --symref -- "$remote_url" HEAD 2>/dev/null | \
         awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
     if [[ -n "$remote_default" && "$remote_default" != "$current_branch" ]]; then
         echo -e "${YELLOW}ℹ️  Remote default is '$remote_default'; staying on '$current_branch'.${NC}"
@@ -998,19 +1041,12 @@ sync_with_remote() {
 
     # Is the current branch on the remote?
     local current_on_remote=false
-    for rb in "${remote_branches[@]}"; do
-        [[ "$rb" == "$current_branch" ]] && { current_on_remote=true; break; }
-    done
+    [[ -n "${remote_set[$current_branch]:-}" ]] && current_on_remote=true
 
     if [[ "$current_on_remote" == "false" ]]; then
         echo -e "\n${YELLOW}Current branch '$current_branch' is not on '$platform'.${NC}"
-        if [[ "$dry_run_mode" != "true" ]]; then
-            if confirm_action "Push '$current_branch' to '$platform' and set upstream?" "y" "Push"; then
-                execute_dangerous "Push new branch" git push -u "$platform" "$current_branch"
-            fi
-        else
-            echo -e "${YELLOW}⚠️  DRY-RUN: Would push '$current_branch' to '$platform'.${NC}"
-        fi
+        echo -e "${YELLOW}Push it yourself when you are ready:${NC}"
+        echo -e "    ${CYAN}git push -u $platform $current_branch${NC}"
     else
         local remote_branch="$current_branch"
         echo -e "  Remote branch: $platform/$remote_branch"
@@ -1041,21 +1077,12 @@ sync_with_remote() {
         if [[ "$behind" -eq 0 && "$ahead" -eq 0 ]]; then
             # Scenario 1: Identical branches
             echo -e "${GREEN}✓ No divergence - branches are identical${NC}"
-            if [[ "$dry_run_mode" != "true" ]] && confirm_action "Push to $platform?" "y" "Push"; then
-                execute_dangerous "Push" git push -u "$platform" "$current_branch"
-            elif [[ "$dry_run_mode" == "true" ]]; then
-                echo -e "${YELLOW}⚠️  DRY-RUN: Would push to $platform.${NC}"
-            fi
+            echo -e "${YELLOW}Nothing to push.${NC}"
         elif [[ "$behind" -eq 0 && "$ahead" -gt 0 ]]; then
             # Scenario 2: Only local commits
             echo -e "${GREEN}✓ Only local commits (no remote changes)${NC}"
-            if [[ "$dry_run_mode" != "true" ]]; then
-                if confirm_action "Push $ahead commit(s) to $platform?" "y" "Push"; then
-                    execute_dangerous "Push" git push -u "$platform" "$current_branch"
-                fi
-            else
-                echo -e "${YELLOW}⚠️  DRY-RUN: Would push $ahead commit(s).${NC}"
-            fi
+            echo -e "${YELLOW}Push $ahead commit(s) yourself when ready:${NC}"
+            echo -e "    ${CYAN}git push -u $platform $current_branch${NC}"
         elif [[ "$behind" -gt 0 ]]; then
             # Scenario 3: Divergence detected
             echo -e "${YELLOW}⚠️  DIVERGENCE DETECTED: Remote has $behind new commit(s)${NC}"
@@ -1076,7 +1103,7 @@ sync_with_remote() {
             echo -e "\n${BLUE}Integration options:${NC}"
             echo "  1) Rebase (clean history)"
             echo "  2) Merge (safer for collaboration)"
-            echo "  3) Skip - Push anyway (divergent branches)"
+            echo "  3) Skip integration (no push)"
             echo "  x) Cancel"
 
             local sync_choice=""
@@ -1096,9 +1123,9 @@ sync_with_remote() {
                             fi
                         fi
 
-                        if [[ "$dry_run_mode" != "true" ]] && confirm_action "Push rebased branch?" "y" "Push"; then
-                            execute_dangerous "Push" git push -u "$platform" "$current_branch"
-                        fi
+                        echo -e "${YELLOW}Rebase rewrote local history. Push it yourself with:${NC}"
+                        echo -e "    ${CYAN}git push --force-with-lease -u $platform $current_branch${NC}"
+                        echo -e "${YELLOW}  (only if you are sure; this rewrites the remote branch)${NC}"
                     else
                         echo -e "${RED}✗ Rebase failed. Resolve conflicts manually.${NC}"
                         [[ "$stashed" == "true" ]] && echo -e "${YELLOW}⚠️  Your changes are stashed.${NC}"
@@ -1110,9 +1137,8 @@ sync_with_remote() {
                     echo -e "\n${BLUE}Merging remote changes...${NC}"
                     if execute_dangerous "Merge remote" git merge "$platform/$remote_branch" --no-edit --quiet; then
                         echo -e "${GREEN}✓ Merge successful${NC}"
-                        if [[ "$dry_run_mode" != "true" ]] && confirm_action "Push merged branch?" "y" "Push"; then
-                            execute_dangerous "Push" git push -u "$platform" "$current_branch"
-                        fi
+                        echo -e "${YELLOW}Push the merged branch yourself when ready:${NC}"
+                        echo -e "    ${CYAN}git push -u $platform $current_branch${NC}"
                     else
                         echo -e "${RED}✗ Merge conflict. Resolve conflicts manually.${NC}"
                         return 1
@@ -1120,10 +1146,10 @@ sync_with_remote() {
                     ;;
 
                 3) # SKIP
-                    echo -e "${YELLOW}⚠️  Will create divergent branches${NC}"
-                    if [[ "$dry_run_mode" != "true" ]] && confirm_action "Push anyway?" "n" "Force push"; then
-                        execute_dangerous "Push with divergence" git push -u "$platform" "$current_branch"
-                    fi
+                    echo -e "${YELLOW}Skipping integration. Local and remote remain divergent.${NC}"
+                    echo -e "${YELLOW}Integrate manually, then push:${NC}"
+                    echo -e "    ${CYAN}git pull --rebase $platform $current_branch${NC}"
+                    echo -e "    ${CYAN}git push -u $platform $current_branch${NC}"
                     ;;
 
                 x|X|"")
@@ -1142,28 +1168,20 @@ sync_with_remote() {
         fi
     fi
 
-    # Offer to push local-only branches. Never merge/rebase a branch that is
-    # not checked out; that needs a checkout or worktree and is a separate flow.
+    # List local-only branches and the exact commands. Never push them here.
+    # Never merge/rebase a branch that is not checked out; that needs a
+    # checkout or worktree and is a separate flow.
     local -a other_local_only=()
     for b in "${local_only[@]}"; do
         [[ "$b" == "$current_branch" ]] || other_local_only+=("$b")
     done
     if [[ ${#other_local_only[@]} -gt 0 ]]; then
         echo -e "\n${YELLOW}Local branches not on '$platform': ${other_local_only[*]}${NC}"
-        if [[ "$dry_run_mode" != "true" ]]; then
-            if confirm_action "Push these branches to '$platform'?" "n" "Push branches"; then
-                for b in "${other_local_only[@]}"; do
-                    [[ "$b" == "$current_branch" ]] && continue
-                    if execute_dangerous "Push $b" git push -u "$platform" "$b"; then
-                        echo -e "${GREEN}✓ Pushed $b${NC}"
-                    else
-                        echo -e "${YELLOW}⚠️  Failed to push $b${NC}"
-                    fi
-                done
-            fi
-        else
-            echo -e "${YELLOW}⚠️  DRY-RUN: Would offer to push local-only branches.${NC}"
-        fi
+        echo -e "${YELLOW}Push them yourself when ready:${NC}"
+        for b in "${other_local_only[@]}"; do
+            [[ "$b" == "$current_branch" ]] && continue
+            echo -e "    ${CYAN}git push -u $platform $b${NC}"
+        done
     fi
 
     if [[ ${#remote_only[@]} -gt 0 ]]; then
@@ -1212,7 +1230,25 @@ create_new_project_workflow() {
         fi
 
         _create_with_new_remote "$project_name" "$visibility" "$platform" ;;
-    2) _clone_existing_remote "standalone" >/dev/null ;;
+    2) local cloned_dir
+       cloned_dir=$(_clone_existing_remote "standalone") || return
+       if [[ -n "$cloned_dir" ]]; then
+         if [[ "$DRY_RUN" == "true" ]]; then
+           preview_and_abort_if_dry
+           return
+         fi
+         if [[ -f "$cloned_dir/repo-crafter.yml" ]]; then
+           echo -e "${GREEN}✓ Using the manifest that came with the clone.${NC}"
+           manifest_validate "$cloned_dir" || true
+         elif [[ -f "$cloned_dir/REMOTE_STATE.yml" ]]; then
+           manifest_migrate_legacy "$cloned_dir" || true
+         else
+           create_manifest "$cloned_dir" "clone_existing" "" || {
+             echo -e "${YELLOW}⚠️  Manifest was not created. The clone is usable.${NC}"
+           }
+         fi
+       fi
+       ;;
     3) _create_local_only ;;
     x|X) echo -e "${YELLOW}Cancelled.${NC}"; return ;;
     *) echo -e "${RED}Invalid choice.${NC}" ;;
@@ -1276,7 +1312,7 @@ _create_with_new_remote() {
   fi
 
   echo -e "${GREEN}✓ Created on $platform${NC}"
-  echo -e "  URL: ${CYAN}$remote_url${NC}"
+  echo -e "  URL: ${CYAN}$(_redact_url_credentials "$remote_url")${NC}"
 
   # Initialize local repository with cleanup on failure
   echo -e "\n${BLUE}Initializing local repository...${NC}"
@@ -1326,12 +1362,14 @@ _create_with_new_remote() {
 
   echo -e "${GREEN}✓ Repository created${NC}"
 
-  # NOTE: Manifest (REMOTE_STATE.yml) is only created for multi-platform projects
-  # For single platform, no manifest needed - the git remote tracks the connection
+  # Every bound project declares its intent, even with a single remote.
+  create_manifest "$dir" "create_with_new_remote" "$remote_url" || {
+    echo -e "${YELLOW}⚠️  Manifest was not created. The remote is configured.${NC}"
+  }
 
   echo -e "\n${GREEN}✅ SUCCESS: Repository created${NC}"
   echo -e "  Local path: ${CYAN}$dir${NC}"
-  echo -e "  Remote URL: ${CYAN}$remote_url${NC}"
+  echo -e "  Remote URL: ${CYAN}$(_redact_url_credentials "$remote_url")${NC}"
 
   preview_and_abort_if_dry
   return 0
@@ -1358,15 +1396,16 @@ _cleanup_failed_creation() {
 
         if [[ -z "$owner" || -z "$repo" || -z "$delete_endpoint" ]]; then
             echo -e "  ${YELLOW}⚠️  Cannot delete remote automatically (missing owner, repo, or delete endpoint).${NC}"
-            echo -e "  ${YELLOW}   Remove it manually: $remote_url${NC}"
+            echo -e "  ${YELLOW}   Remove it manually: $(_redact_url_credentials "$remote_url")${NC}"
         else
-            delete_endpoint="${delete_endpoint//\{owner\}/$owner}"
-            delete_endpoint="${delete_endpoint//\{repo\}/$repo}"
-
-            if _delete_remote_quiet "$platform" "$delete_endpoint" "$delete_method"; then
+            delete_endpoint=$(_build_delete_endpoint "$platform" "$remote_url") || delete_endpoint=""
+            if [[ -z "$delete_endpoint" ]]; then
+                echo -e "  ${YELLOW}⚠️  Refusing to delete: the remote URL does not yield a safe endpoint.${NC}"
+                echo -e "  ${YELLOW}   Remove it manually: $(_redact_url_credentials "$remote_url")${NC}"
+            elif _delete_remote_quiet "$platform" "$delete_endpoint" "$delete_method"; then
                 echo -e "  ${GREEN}✓ Remote repository deleted${NC}"
             else
-                echo -e "  ${YELLOW}⚠️  Remote deletion failed; remove it manually: $remote_url${NC}"
+                echo -e "  ${YELLOW}⚠️  Remote deletion failed; remove it manually: $(_redact_url_credentials "$remote_url")${NC}"
             fi
         fi
     fi
@@ -1410,6 +1449,13 @@ _clone_existing_remote() {
 
   [[ -z "$first_url" ]] && { echo -e "${RED}No URL provided.${NC}" >&2; return 1; }
 
+  # Reject option-injection / non-standard transports before git sees the URL.
+  _validate_git_url "$first_url" || {
+    echo -e "${RED}❌ Invalid remote URL: '$first_url'${NC}" >&2
+    echo -e "${YELLOW}   Only https://… or git@host:… URLs are accepted.${NC}" >&2
+    return 1
+  }
+
   # --- PART 2: PARSE URL & DETECT PLATFORM (Your existing code) ---
   local parsed_path=$(parse_git_url "$first_url")
   [[ -z "$parsed_path" ]] && { echo -e "${RED}Invalid URL format${NC}" >&2; return 1; }
@@ -1423,7 +1469,7 @@ _clone_existing_remote() {
   host=$(extract_host_from_url "$first_url")
 
   local platform=""
-  platform=$(detect_platform_from_url "$first_url") || { echo -e "${RED}Unknown platform for URL: $first_url${NC}" >&2; return 1; }
+  platform=$(detect_platform_from_url "$first_url") || { echo -e "${RED}Unknown platform for URL: $(_redact_url_credentials "$first_url")${NC}" >&2; return 1; }
 
   # --- PART 3: DECIDE DESTINATION DIRECTORY (THE NEW LOGIC) ---
   local dest_dir=""
@@ -1438,6 +1484,15 @@ _clone_existing_remote() {
     echo -e "${BLUE}Single platform ($platform): Cloning to ${PLATFORM_WORK_DIR[$platform]}/${NC}" >&2
   fi
 
+  # Dry run: report the clone without touching the filesystem or the network.
+  # The caller still receives the destination path it would have used.
+  if [[ "$DRY_RUN" == "true" ]]; then
+      DRY_RUN_ACTIONS+=("Clone $(_redact_url_credentials "$first_url") into $dest_dir")
+      echo -e "${YELLOW}[DRY RUN] Would clone $(_redact_url_credentials "$first_url") into $dest_dir${NC}" >&2
+      echo "$dest_dir"
+      return 0
+  fi
+
   # --- PART 4: CLONE (Your existing code) ---
   # Check SSH auth
   if [[ "$first_url" =~ ^git@ ]]; then
@@ -1446,7 +1501,7 @@ _clone_existing_remote() {
 
   # Clone (no pipe: keep git's exit status and full error output)
   echo -e "\n${BLUE}Cloning to: $dest_dir${NC}" >&2
-  if ! git clone "$first_url" "$dest_dir"; then
+  if ! git clone -- "$first_url" "$dest_dir"; then
       echo -e "${RED}❌ Failed to clone repository${NC}" >&2
       echo -e "${YELLOW}Check: 1) URL is correct 2) SSH keys configured 3) Repository exists${NC}" >&2
       return 1
@@ -1546,7 +1601,12 @@ convert_single_to_multi_platform() {
   fi
 
   echo -e "\n${BLUE}Current remote:${NC}"
-  echo -e "  $current_url"
+  echo -e "  $(_redact_url_credentials "$current_url")"
+
+  # Warn if an existing manifest disagrees with the current remotes.
+  if [[ -f "$source_dir/repo-crafter.yml" ]]; then
+      manifest_reconcile "$source_dir" "true" || true
+  fi
 
   # 4. Ask for additional URLs
   echo -e "\n${YELLOW}Enter additional repository URLs (one per line, empty to finish):${NC}"
@@ -1585,7 +1645,7 @@ convert_single_to_multi_platform() {
         echo -e "${YELLOW}Aborted.${NC}"
         return 1
       fi
-      echo -e "${GREEN}Removed existing directory '$dest_dir'.${NC}"
+      [[ "$DRY_RUN" == "true" ]] || echo -e "${GREEN}Removed existing directory '$dest_dir'.${NC}"
     else
       echo -e "${YELLOW}Aborting conversion.${NC}"
       return 1
@@ -1637,25 +1697,11 @@ convert_single_to_multi_platform() {
       fi
   done
 
-  # 9. Create multi-platform manifest
-  echo -e "\n${YELLOW}Creating multi-platform manifest...${NC}"
-
-  # Build platform_urls array; use a unique key per URL so none are overwritten
-  declare -A platform_urls
-  local manifest_key
-  for url in "${urls[@]}"; do
-      manifest_key=$(detect_platform_from_url "$url") || manifest_key="unknown"
-      if [[ -n "${platform_urls[$manifest_key]:-}" ]]; then
-          local n=2
-          while [[ -n "${platform_urls[${manifest_key}_${n}]:-}" ]]; do
-              ((n++)) || true
-          done
-          manifest_key="${manifest_key}_${n}"
-      fi
-      platform_urls["$manifest_key"]="$url"
-  done
-
-  create_multi_platform_manifest "$dest_dir" "$project_name" platform_urls "convert_single_to_multi"
+  # 9. Create the manifest from the actual git remotes, never from platform keys
+  echo -e "\n${YELLOW}Creating project manifest...${NC}"
+  create_manifest "$dest_dir" "convert_single_to_multi" "$current_url" || {
+    echo -e "${YELLOW}⚠️  Manifest was not created. Remotes are configured; you can add it later.${NC}"
+  }
 
   # 10. Show status
   echo -e "\n${GREEN}✅ Successfully converted to multi-platform!${NC}"
@@ -1668,8 +1714,53 @@ convert_single_to_multi_platform() {
 }
 
 ##### Convert a local project to remote project #####
+# Copy a project's files into a bound destination, never the .git directory.
+_bind_copy_files() {
+  local source_dir="$1"
+  local dest_dir="$2"
+
+  if command -v rsync &>/dev/null; then
+    rsync -av --exclude='.git' "$source_dir/" "$dest_dir/" || return 1
+  else
+    ( cd "$source_dir" && find . -name '.git' -prune -o -print0 | cpio -pdm0 "$dest_dir" ) || return 1
+  fi
+  return 0
+}
+
+# Show status and offer a single commit; a failed commit leaves files in place.
+_bind_commit_changes() {
+  local dest_dir="$1"
+  local default_message="$2"
+  local commit_choice commit_msg
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    DRY_RUN_ACTIONS+=("Offer to commit changes in $dest_dir")
+    echo -e "${YELLOW}[DRY RUN] Would offer to commit changes in $dest_dir${NC}"
+    return 0
+  fi
+
+  echo -e "\n${BLUE}Repository status:${NC}"
+  git -C "$dest_dir" status --short
+
+  echo -e "\n${BLUE}Commit changes?${NC}"
+  echo "  y) Yes, commit now"
+  echo "  n) No, I'll handle manually"
+  read -rp "Choice (y/n): " commit_choice
+
+  if [[ "$commit_choice" =~ ^[Yy]$ ]]; then
+    read -rp "Commit message: " commit_msg
+    [[ -z "$commit_msg" ]] && commit_msg="$default_message"
+    if git -C "$dest_dir" add -A && git -C "$dest_dir" commit -m "$commit_msg"; then
+      echo -e "${GREEN}✓ Changes committed${NC}"
+    else
+      echo -e "${YELLOW}⚠️  Commit failed. Files are in place; run 'git add -A && git commit' manually.${NC}"
+    fi
+  else
+    echo -e "${YELLOW}⚠️  Changes not committed. Run 'git add . && git commit' when ready.${NC}"
+  fi
+}
+
 convert_local_to_remote_workflow() {
-  # DEBUG: echo "DEBUG: DRY_RUN=$DRY_RUN"
   echo -e "\n${BLUE}=== BIND LOCAL PROJECT TO REMOTE ===${NC}"
 
   # === SELECT LOCAL PROJECT ===
@@ -1752,7 +1843,6 @@ convert_local_to_remote_workflow() {
   local platform_array=()
   local visibility=""
   local user_name=$(git config --global user.name)
-  local continue_workflow=true  # Control flag for workflow continuation
 
   # === OPTION 1: CREATE NEW REPOSITORIES ===
   if [[ "$bind_choice" == "1" ]]; then
@@ -1848,6 +1938,12 @@ convert_local_to_remote_workflow() {
     # Set $dest_dir to this value for any later logic that expects it.
     dest_dir="$cloned_dir"
 
+    # Dry run stops here: the clone was only planned, not performed.
+    if [[ "$DRY_RUN" == "true" ]]; then
+        preview_and_abort_if_dry
+        return 0
+    fi
+
     # Now, change into the cloned directory to proceed with merging files.
     cd "$dest_dir" || { echo -e "${RED}❌ Cannot enter cloned directory.${NC}"; return 1; }
 
@@ -1865,38 +1961,13 @@ convert_local_to_remote_workflow() {
 
         # COPY files, not move
         echo -e "${BLUE}Copying files...${NC}"
-        if command -v rsync &>/dev/null; then
-          rsync -av --exclude='.git' "$source_dir/" . || {
-            echo -e "${RED}❌ Copy failed; original kept.${NC}"
-            return 1
-          }
-        else
-          (cd "$source_dir" && find . -name '.git' -prune -o -print0 | cpio -pdm0 .) || {
-            echo -e "${RED}❌ Copy failed; original kept.${NC}"
-            return 1
-          }
+        if ! _bind_copy_files "$source_dir" "$dest_dir"; then
+          echo -e "${RED}❌ Copy failed; original kept.${NC}"
+          return 1
         fi
 
         # === GIT STATUS & COMMIT ===
-        echo -e "\n${BLUE}Repository status:${NC}"
-        git status --short
-
-        echo -e "\n${BLUE}Commit changes?${NC}"
-        echo "  y) Yes, commit now"
-        echo "  n) No, I'll handle manually"
-        read -rp "Choice (y/n): " commit_choice
-
-        if [[ "$commit_choice" =~ ^[Yy]$ ]]; then
-            read -rp "Commit message: " commit_msg
-            [[ -z "$commit_msg" ]] && commit_msg="Merge local changes from $project_name"
-            if git -C "$dest_dir" add -A && git -C "$dest_dir" commit -m "$commit_msg"; then
-                echo -e "${GREEN}✓ Changes committed${NC}"
-            else
-                echo -e "${YELLOW}⚠️  Commit failed. Files are in place; run 'git add -A && git commit' manually.${NC}"
-            fi
-        else
-            echo -e "${YELLOW}⚠️  Changes not committed. Run 'git add . && git commit' when ready.${NC}"
-        fi
+        _bind_commit_changes "$dest_dir" "Merge local changes from $project_name"
 
         # === ADD OTHER REMOTES ===
         if [[ ${#urls[@]} -gt 1 ]]; then
@@ -1905,7 +1976,13 @@ convert_local_to_remote_workflow() {
                 local url="${urls[$i]}"
                 local remote_name="remote$((i+1))"
 
-                git remote add "$remote_name" "$url" 2>/dev/null && \
+                # Reject option-injection / non-standard transports.
+                _validate_git_url "$url" || {
+                    echo -e "  ${YELLOW}⚠️  Skipping invalid URL: $url${NC}"
+                    continue
+                }
+
+                git remote add "$remote_name" -- "$url" 2>/dev/null && \
                     echo -e "  ${GREEN}✓ Added: $remote_name${NC}" || \
                     echo -e "  ${YELLOW}⚠️  Failed to add: $remote_name${NC}"
             done
@@ -1936,7 +2013,21 @@ convert_local_to_remote_workflow() {
         echo -e "\n${GREEN}✅ Bound to existing repository!${NC}"
         echo -e "Location: $dest_dir"
         echo -e "${YELLOW}Remotes available:${NC}"
-        git remote -v
+        git remote -v | sed -E 's#(https?://)[^/@]+@#\1#g'
+
+        # A cloned repository may already declare its intent; never replace it.
+        if [[ -f "$dest_dir/repo-crafter.yml" ]]; then
+            echo -e "${GREEN}✓ Using the manifest that came with the clone.${NC}"
+            manifest_validate "$dest_dir" || true
+            manifest_reconcile "$dest_dir" || true
+        elif [[ -f "$dest_dir/REMOTE_STATE.yml" ]]; then
+            manifest_migrate_legacy "$dest_dir" || true
+        else
+            # Declare the actual remotes (origin plus any remoteN) in a manifest
+            create_manifest "$dest_dir" "connect_existing" "$first_url" || {
+                echo -e "${YELLOW}⚠️  Manifest was not created. Remotes are configured.${NC}"
+            }
+        fi
 
         # Offer to reconcile branches now that local and remote are connected
         if [[ "$DRY_RUN" != "true" ]] && confirm_action "Synchronize '$project_name' with 'origin' now?" "y"; then
@@ -1948,30 +2039,33 @@ convert_local_to_remote_workflow() {
     fi
 
   if [[ "$bind_choice" == "1" ]]; then
-    echo -e "\n${BLUE}Copying your local files...${NC}"
-    echo -e "${YELLOW}This will copy files from:${NC}"
-    echo -e "  Source: $source_dir"
-    echo -e "  Destination: $dest_dir"
+    if [[ "$DRY_RUN" == "true" ]]; then
+      DRY_RUN_ACTIONS+=("Copy local files from $source_dir to $dest_dir")
+      echo -e "${YELLOW}[DRY RUN] Would copy local files to $dest_dir${NC}"
+    else
+      echo -e "\n${BLUE}Copying your local files...${NC}"
+      echo -e "${YELLOW}This will copy files from:${NC}"
+      echo -e "  Source: $source_dir"
+      echo -e "  Destination: $dest_dir"
 
-    if confirm_action "Copy local files (overwriting any conflicts)?"; then
-      echo -e "${BLUE}Copying files...${NC}"
-      if command -v rsync &>/dev/null; then
-        rsync -av --exclude='.git' "$source_dir/" "$dest_dir/" || {
-          echo -e "${RED}❌ Failed to copy files with rsync${NC}"
-          return 1
-        }
-      else
-        (cd "$source_dir" && find . -name '.git' -prune -o -print0 | cpio -pdm0 "$dest_dir") || {
+      if confirm_action "Copy local files (overwriting any conflicts)?"; then
+        echo -e "${BLUE}Copying files...${NC}"
+        if ! _bind_copy_files "$source_dir" "$dest_dir"; then
           echo -e "${RED}❌ Failed to copy files${NC}"
           return 1
-        }
+        fi
+        echo -e "${GREEN}✅ Files copied successfully${NC}"
+      else
+        echo -e "${YELLOW}⚠️  Skipping file copy${NC}"
       fi
-      echo -e "${GREEN}✅ Files copied successfully${NC}"
-    else
-      echo -e "${YELLOW}⚠️  Skipping file copy${NC}"
     fi
   fi
 
+  # Dry run stops before any directory change, git init, or commit.
+  if [[ "$DRY_RUN" == "true" ]]; then
+    preview_and_abort_if_dry
+    return 0
+  fi
 
   cd "$dest_dir" || {
     echo -e "${RED}❌ Failed to change to destination directory: $dest_dir${NC}"
@@ -1994,25 +2088,7 @@ convert_local_to_remote_workflow() {
   fi
 
   if [[ "$bind_choice" == "1" ]]; then
-    echo -e "\n${BLUE}Repository status:${NC}"
-    git status --short
-
-    echo -e "\n${BLUE}Commit changes?${NC}"
-    echo "  y) Yes, commit now"
-    echo "  n) No, I'll handle manually"
-    read -rp "Choice (y/n): " commit_choice
-
-    if [[ "$commit_choice" =~ ^[Yy]$ ]]; then
-      read -rp "Commit message: " commit_msg
-      [[ -z "$commit_msg" ]] && commit_msg="Initial commit with local changes from $project_name"
-      if git -C "$dest_dir" add -A && git -C "$dest_dir" commit -m "$commit_msg"; then
-        echo -e "${GREEN}✅ Changes committed${NC}"
-      else
-        echo -e "${YELLOW}⚠️  Commit failed. Files are in place; run 'git add -A && git commit' manually.${NC}"
-      fi
-    else
-      echo -e "${YELLOW}⚠️  Changes not committed. Run 'git add . && git commit' when ready.${NC}"
-    fi
+    _bind_commit_changes "$dest_dir" "Initial commit with local changes from $project_name"
   fi
 
   # === REMOTE CONFIGURATION ===
@@ -2030,7 +2106,7 @@ convert_local_to_remote_workflow() {
         # Add remote
         if handle_existing_remote "$platform" "$new_repo_url"; then
           if ! git remote get-url "$platform" &>/dev/null; then
-            execute_dangerous "Add remote" git remote add "$platform" "$new_repo_url"
+            execute_dangerous "Add remote" git remote add "$platform" -- "$new_repo_url"
           fi
           echo -e "${GREEN}✓ Connected to $platform${NC}"
 
@@ -2049,20 +2125,22 @@ convert_local_to_remote_workflow() {
       fi
     done
 
-    # Create manifest for multi-platform projects
+    # Create manifest for multi-platform projects from the actual git remotes
     if [[ ${#platform_array[@]} -gt 1 ]]; then
       echo -e "\n${BLUE}Creating project manifest...${NC}"
-      # Collect all remote URLs
-      declare -A platform_urls
-      for platform in "${platform_array[@]}"; do
-        platform_urls["$platform"]=$(git remote get-url "$platform" 2>/dev/null || echo "")
-      done
-      create_multi_platform_manifest "$dest_dir" "$project_name" platform_urls "convert_local_to_remote"
+      local primary_url=""
+      primary_url=$(git remote get-url "${platform_array[0]}" 2>/dev/null || true)
+      create_manifest "$dest_dir" "convert_local_to_remote" "$primary_url" || {
+        echo -e "${YELLOW}⚠️  Manifest was not created. Remotes are configured.${NC}"
+      }
     elif [[ ${#platform_array[@]} -eq 1 ]]; then
-      # Single platform: offer to reconcile the branches we just connected
+      # Single platform: declare the remote, then offer to reconcile branches
       local sync_platform="${platform_array[0]}"
       local sync_url
       sync_url=$(git remote get-url "$sync_platform" 2>/dev/null || echo "")
+      create_manifest "$dest_dir" "convert_local_to_remote" "$sync_url" || {
+        echo -e "${YELLOW}⚠️  Manifest was not created. The remote is configured.${NC}"
+      }
       if [[ -n "$sync_url" && "$DRY_RUN" != "true" ]] && \
          confirm_action "Synchronize '$project_name' with '$sync_platform' now?" "y"; then
         ( sync_with_remote "$sync_platform" "$sync_url" ) || echo -e "${YELLOW}Synchronization skipped.${NC}"
@@ -2113,10 +2191,15 @@ convert_remote_to_local_workflow() {
   echo -e "${YELLOW}This will:${NC}"
   echo "  - Remove ALL git remotes"
   echo "  - Move project to $dest_dir"
-  echo "  - Delete REMOTE_STATE.yml if exists"
+  echo "  - Delete repo-crafter.yml (and legacy REMOTE_STATE.yml) if present"
   confirm_action "This will remove ALL git remotes and move project to Local_Projects/" || return
 
   cd "$source_dir" || { echo -e "${RED}❌ Cannot enter '$source_dir'.${NC}"; return 1; }
+
+  # Warn if the manifest and git remotes disagree before removing anything.
+  if [[ -f "repo-crafter.yml" ]]; then
+      manifest_reconcile "$PWD" "true" || true
+  fi
 
   echo -e "\n${BLUE}=== Checking Repository Status ===${NC}"
   if git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null; then
@@ -2131,7 +2214,7 @@ convert_remote_to_local_workflow() {
   mapfile -t remotes < <(git remote 2>/dev/null)
   for remote in "${remotes[@]}"; do
       if execute_dangerous "Remove remote $remote" git remote remove "$remote"; then
-          echo -e "${GREEN}✓ Removed remote: $remote${NC}"
+          [[ "$DRY_RUN" == "true" ]] || echo -e "${GREEN}✓ Removed remote: $remote${NC}"
           removed_count=$((removed_count + 1))
       else
           echo -e "${YELLOW}⚠️  Skipped removing remote: $remote${NC}"
@@ -2143,8 +2226,9 @@ convert_remote_to_local_workflow() {
       confirm_action "Continue with directory move anyway?" || return
   fi
 
-  # 4. Delete manifest
-  [[ -f "REMOTE_STATE.yml" ]] && execute_safe rm -f "REMOTE_STATE.yml"
+  # 4. Delete manifest (the project is no longer bound to any remote)
+  [[ -f "repo-crafter.yml" ]] && execute_safe "Remove repo-crafter.yml" rm -f "repo-crafter.yml"
+  [[ -f "REMOTE_STATE.yml" ]] && execute_safe "Remove REMOTE_STATE.yml" rm -f "REMOTE_STATE.yml"
 
   cd - >/dev/null || { echo -e "${RED}❌ Cannot return to previous directory.${NC}"; return 1; }
 
@@ -2156,7 +2240,9 @@ convert_remote_to_local_workflow() {
     echo -e "${RED}Move failed.${NC}"; return
   }
 
-  echo -e "\n${GREEN}✅ Project unbound and moved to $dest_dir${NC}"
+  if [[ "$DRY_RUN" != "true" ]]; then
+    echo -e "\n${GREEN}✅ Project unbound and moved to $dest_dir${NC}"
+  fi
   preview_and_abort_if_dry
 }
 
@@ -2242,12 +2328,16 @@ _delete_local_copy() {
     echo -e "\n${YELLOW}This deletes the local files only.${NC}"
     echo -e "  • Remote repositories stay untouched: ${remotes[*]}"
     echo -e "  • You can clone it again later"
-    echo -e "  • ${CYAN}REMOTE_STATE.yml${NC} (if present) is deleted with the folder"
+    echo -e "  • ${CYAN}repo-crafter.yml${NC} and legacy ${CYAN}REMOTE_STATE.yml${NC} (if present) are deleted with the folder"
   fi
 
   confirm_action "Are you sure you want to DELETE the local files of $project_name?" || return
 
-  execute_dangerous "Delete local directory" rm -rf "$source_dir" && echo -e "${GREEN}✅ Deleted local copy${NC}" || echo -e "${RED}❌ Failed${NC}"
+  if execute_dangerous "Delete local directory" rm -rf "$source_dir"; then
+    [[ "$DRY_RUN" == "true" ]] || echo -e "${GREEN}✅ Deleted local copy${NC}"
+  else
+    echo -e "${RED}❌ Failed${NC}"
+  fi
   sleep 5
   preview_and_abort_if_dry
 }
@@ -2297,6 +2387,11 @@ _delete_both() {
 
   cd "$source_dir" || { echo -e "${RED}❌ Cannot enter '$source_dir'.${NC}"; return 1; }
 
+  # Warn if the manifest and git remotes disagree before deleting anything.
+  if [[ -f "repo-crafter.yml" ]]; then
+      manifest_reconcile "$PWD" "true" || true
+  fi
+
   # Delete every remote repository, each on its own platform
   echo -e "\n${YELLOW}Deleting remote repositories...${NC}"
   local remotes=()
@@ -2306,27 +2401,22 @@ _delete_both() {
     return 1
   fi
 
-  local remote url platform owner delete_endpoint
+  local remote url platform delete_endpoint
   for remote in "${remotes[@]}"; do
     url=$(git remote get-url "$remote" 2>/dev/null) || continue
     if ! platform=$(detect_platform_from_url "$url"); then
-      echo -e "${RED}❌ Unknown platform for '$remote' ($url). Local files preserved.${NC}"
+      echo -e "${RED}❌ Unknown platform for '$remote' ($(_redact_url_credentials "$url")). Local files preserved.${NC}"
       return 1
     fi
-    if ! owner=$(get_owner_from_ssh_url "$url"); then
-      echo -e "${RED}❌ Cannot read owner from '$url'. Local files preserved.${NC}"
+    # The target comes from this remote's URL, never from the folder name.
+    if ! delete_endpoint=$(_build_delete_endpoint "$platform" "$url"); then
+      echo -e "${RED}❌ Refusing to delete '$remote': its URL does not yield a safe endpoint. Local files preserved.${NC}"
+      echo -e "${YELLOW}   URL: $(_redact_url_credentials "$url")${NC}"
       return 1
     fi
-    delete_endpoint="${PLATFORM_REPO_DELETE_ENDPOINT[$platform]:-}"
-    if [[ -z "$delete_endpoint" ]]; then
-      echo -e "${RED}❌ No delete endpoint configured for '$platform'. Local files preserved.${NC}"
-      return 1
-    fi
-    delete_endpoint="${delete_endpoint//\{owner\}/$owner}"
-    delete_endpoint="${delete_endpoint//\{repo\}/$project_name}"
 
     if execute_dangerous "Delete remote repository ($platform)" _delete_remote_quiet "$platform" "$delete_endpoint" "${PLATFORM_REPO_DELETE_METHOD[$platform]:-DELETE}"; then
-      echo -e "${GREEN}✅ Remote repository deleted ($platform)${NC}"
+      [[ "$DRY_RUN" == "true" ]] || echo -e "${GREEN}✅ Remote repository deleted ($platform)${NC}"
     else
       echo -e "${RED}❌ Failed to delete remote repository ($platform)${NC}"
       echo -e "${YELLOW}Local files preserved. Operation cancelled.${NC}"
@@ -2338,7 +2428,7 @@ _delete_both() {
   cd "$HOME"
   echo -e "\n${YELLOW}Deleting local files...${NC}"
   if execute_dangerous "Delete local directory" rm -rf "$source_dir"; then
-    echo -e "${GREEN}✅ Deleted everything${NC}"
+    [[ "$DRY_RUN" == "true" ]] || echo -e "${GREEN}✅ Deleted everything${NC}"
   else
     echo -e "${RED}❌ Failed to delete local files${NC}"
     return 1
@@ -2506,12 +2596,7 @@ gitignore_maker() {
             ;;
 
         2) # Fetch from GitHub gitignore templates
-            if ! command -v curl &>/dev/null; then
-                echo -e "${YELLOW}⚠️  curl not installed. Using generic patterns instead.${NC}"
-                _append_generic_patterns "$ignore_file"
-                echo -e "${GREEN}✓ Added generic patterns${NC}"
-            else
-                echo -e "\n${BLUE}Fetching available templates from GitHub...${NC}"
+            echo -e "\n${BLUE}Fetching available templates from GitHub...${NC}"
                 local templates
                 templates=$(curl -fsS https://api.github.com/repos/github/gitignore/contents 2>/dev/null | jq -r '.[] | select(.type=="file") | .name' 2>/dev/null | sed 's/\.gitignore$//' || true)
 
@@ -2561,7 +2646,6 @@ gitignore_maker() {
                         done
                     fi
                 fi
-            fi
             ;;
 
         3) # Manual entry only
@@ -2728,13 +2812,20 @@ handle_existing_remote() {
     local platform="$1"  # e.g., "gitlab"
     local remote_url="$2" # The new URL to add
 
+    # Reject option-injection / non-standard transports before git sees the URL.
+    _validate_git_url "$remote_url" || {
+        echo -e "${RED}❌ Invalid remote URL: '$remote_url'${NC}" >&2
+        echo -e "${YELLOW}   Only https://… or git@host:… URLs are accepted.${NC}" >&2
+        return 1
+    }
+
     if git remote get-url "$platform" &>/dev/null; then
         echo -e "${YELLOW}⚠️  A remote named '$platform' already exists in this repository.${NC}"
-        echo "Current URL: $(git remote get-url "$platform")"
-        echo "New URL:     $remote_url"
+        echo "Current URL: $(_redact_url_credentials "$(git remote get-url "$platform")")"
+        echo "New URL:     $(_redact_url_credentials "$remote_url")"
 
         if confirm_action "Do you want to update the existing remote '$platform' to point to the new URL?" "y" "Update remote"; then
-            execute_dangerous "Update remote $platform" git remote set-url "$platform" "$remote_url"
+            execute_dangerous "Update remote $platform" git remote set-url "$platform" -- "$remote_url"
             return 0
         else
             echo -e "${YELLOW}⚠️  Keeping existing remote '$platform'. You may need to choose a different platform name.${NC}"
@@ -2782,14 +2873,13 @@ parse_git_url() {
         url="${url#*@}"
     fi
 
-    # Handle SSH URL format (git@host:path)
-    if [[ "$url" =~ ^[^/@]+@[^:/]+: ]]; then
-        # Remove everything up to and including ':'
-        url="${url#*:}"
+    # Handle SSH URL format (git@host:path). Keep the full owner/repo path.
+    if [[ "$url" =~ ^[^/@]+@[^:/]+:(.+) ]]; then
+        url="${BASH_REMATCH[1]}"
+    else
+        # Protocol form: remove the host part (everything up to first '/')
+        url="${url#*/}"
     fi
-
-    # Remove host part (everything up to first '/')
-    url="${url#*/}"
 
     # Remove .git suffix if present
     url="${url%.git}"
@@ -2801,6 +2891,80 @@ parse_git_url() {
     echo "$url"
 }
 
+
+# Remove HTTP(S) userinfo (user[:password]@) from a URL. Used before a URL is
+# stored, compared, or printed so an embedded token never reaches the manifest,
+# a log, or the terminal. SSH user names (git@host) are left untouched.
+_redact_url_credentials() {
+    local url="$1"
+    if [[ "$url" =~ ^(https?://)[^/@]+@(.*)$ ]]; then
+        printf '%s%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    else
+        printf '%s' "$url"
+    fi
+}
+
+# Percent-encode one path segment for an API URL. jq is already a hard
+# dependency, so this adds no new requirement.
+_url_encode_segment() {
+    printf '%s' "$1" | jq -sRr @uri
+}
+
+# Validate an owner taken from a remote URL before it is interpolated into a
+# delete endpoint. Anything that could retarget the request path is rejected.
+#   github: one name, [A-Za-z0-9._-]
+#   gitlab: nested groups allowed, but no traversal or encoded separators
+_validate_remote_owner() {
+    local platform="$1" owner="$2"
+    [[ -z "$owner" ]] && return 1
+    [[ "$owner" == "." ]] && return 1
+    [[ "$owner" == *$'\n'* || "$owner" == *$'\r'* || "$owner" == *$'\t'* ]] && return 1
+    [[ "$owner" == *..* || "$owner" == *%* || "$owner" == *\?* || "$owner" == *\#* ]] && return 1
+    [[ "$owner" == /* || "$owner" == */ || "$owner" == *//* ]] && return 1
+    case "$platform" in
+        github) [[ "$owner" =~ ^[A-Za-z0-9._-]+$ ]] || return 1 ;;
+        gitlab) [[ "$owner" =~ ^[A-Za-z0-9._/-]+$ ]] || return 1 ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# Validate a repository name taken from a remote URL. It must be a single
+# path segment on both supported platforms.
+_validate_remote_repo() {
+    local repo="$1"
+    [[ -z "$repo" ]] && return 1
+    [[ "$repo" == "." || "$repo" == ".." ]] && return 1
+    [[ "$repo" == *..* || "$repo" == *%* || "$repo" == *\?* || "$repo" == *\#* ]] && return 1
+    [[ "$repo" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    return 0
+}
+
+# Build a delete endpoint from the remote URL itself, never from the local
+# directory name. Owner and repository are validated and percent-encoded before
+# substitution. Returns 1 without any API call when the URL is not trustworthy.
+_build_delete_endpoint() {
+    local platform="$1" url="$2"
+    local template="${PLATFORM_REPO_DELETE_ENDPOINT[$platform]:-}"
+    [[ -z "$template" ]] && return 1
+
+    local path owner repo
+    path=$(parse_git_url "$url")
+    [[ -z "$path" || "$path" != */* ]] && return 1
+    repo="${path##*/}"
+    owner="${path%/*}"
+
+    _validate_remote_owner "$platform" "$owner" || return 1
+    _validate_remote_repo "$repo" || return 1
+
+    local enc_owner enc_repo
+    enc_owner=$(_url_encode_segment "$owner")
+    enc_repo=$(_url_encode_segment "$repo")
+
+    template="${template//\{owner\}/$enc_owner}"
+    template="${template//\{repo\}/$enc_repo}"
+    printf '%s' "$template"
+}
 
 # Detect platform from a git URL
 # Returns: platform name or empty string if not found
@@ -2817,6 +2981,9 @@ detect_platform_from_url() {
     elif [[ "$url" =~ ^[^@]+@([^:/]+) ]]; then
         host="${BASH_REMATCH[1]}"
     fi
+
+    # Drop any HTTP(S) userinfo before comparing the host.
+    host="${host##*@}"
 
     [[ -z "$host" ]] && return 1
 
@@ -2838,13 +3005,18 @@ extract_host_from_url() {
     local url="$1"
     [[ -z "$url" ]] && return 1
 
+    local host=""
     if [[ "$url" =~ ^git@([^:]+): ]]; then
-        echo "${BASH_REMATCH[1]}"
+        host="${BASH_REMATCH[1]}"
     elif [[ "$url" =~ ^https?://([^/]+)/ ]]; then
-        echo "${BASH_REMATCH[1]}"
+        host="${BASH_REMATCH[1]}"
     elif [[ "$url" =~ ^[^@]+@([^:/]+) ]]; then
-        echo "${BASH_REMATCH[1]}"
+        host="${BASH_REMATCH[1]}"
     fi
+
+    # Drop any HTTP(S) userinfo so a token cannot be mistaken for the host.
+    host="${host##*@}"
+    [[ -n "$host" ]] && echo "$host"
 }
 
 
@@ -2885,98 +3057,575 @@ gitignore_maker_interactive() {
 }
 
 
-#to create manifest file for multiple repositories
-create_multi_platform_manifest() {
-  local dir="$1"
-  local name="$2"
-  local -n urls_ref="$3"
-  local action_type="${4:-"create_with_new_remote"}"
-  local user_name=$(git config --global user.name 2>/dev/null || echo "unknown")
-  local commit_hash=$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo "unknown")
-  local branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+# ======================= MANIFEST (HUMAN-OWNED INTENT) =========================
+# repo-crafter.yml is the committed source of truth. The tool reads it and only
+# writes it on an explicit create/convert/init/migrate action. Volatile state
+# (head commits, timestamps, ahead/behind) is never stored here; it is derived
+# from git on demand.
 
-  echo -e "\n${BLUE}Creating multi-platform manifest...${NC}"
+_url_host() {
+  local url="$1" host=""
 
-  # Check if jq/yq are available
-  if ! command -v yq &>/dev/null; then
-    echo -e "${YELLOW}⚠️  yq not installed. Creating simple manifest instead.${NC}"
-    if [[ "$DRY_RUN" == "true" ]]; then
-    DRY_RUN_ACTIONS+=("Create manifest at $dir/REMOTE_STATE.yml")
-    return 0
+  if [[ "$url" =~ ^[a-z][a-z0-9+.-]*://([^/]+)/ ]]; then
+    host="${BASH_REMATCH[1]}"
+  elif [[ "$url" =~ ^[^/@]+@([^:/]+)[:/] ]]; then
+    host="${BASH_REMATCH[1]}"
+  else
+    return 1
+  fi
+
+  host="${host##*@}"
+  [[ -n "$host" ]] || return 1
+  printf '%s' "$host"
+}
+
+_yaml_quote() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  # Escape control characters so they stay inside the quoted scalar and can
+  # not break out to inject YAML keys or emit terminal escapes.
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  value="${value//$'\e'/\\e}"
+  printf '"%s"' "$value"
+}
+
+_manifest_write_atomic() {
+  local target="$1"
+  local content="$2"
+  local dir tmp
+
+  dir=$(dirname "$target")
+  tmp=$(mktemp "$dir/.repo-crafter.yml.XXXXXX") || {
+    echo -e "${RED}❌ Could not create a temporary manifest in $dir${NC}" >&2
+    return 1
+  }
+
+  if ! printf '%s\n' "$content" > "$tmp"; then
+    rm -f "$tmp"
+    echo -e "${RED}❌ Could not write the temporary manifest${NC}" >&2
+    return 1
+  fi
+
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    echo -e "${RED}❌ Refusing to write an empty manifest${NC}" >&2
+    return 1
+  fi
+
+  # Validate before replacing the original. yq is optional; when present it is
+  # the strongest check. The original file is never touched on failure.
+  if command -v yq &>/dev/null; then
+    if ! yq e '.' "$tmp" >/dev/null 2>&1; then
+      rm -f "$tmp"
+      echo -e "${RED}❌ Generated manifest is not valid YAML; original left untouched.${NC}" >&2
+      return 1
     fi
-    cat > "$dir/REMOTE_STATE.yml" << EOF
-# REPO-CRAFTER REMOTE STATE MANIFEST
-# Generated: $(date)
-# Project: $name
-# Action: $action_type
-# Branch: $branch
-# Commit: $commit_hash
+  fi
 
-platforms:
-EOF
-    for platform in "${!urls_ref[@]}"; do
-      echo "  $platform:" >> "$dir/REMOTE_STATE.yml"
-      echo "    remote_name: \"$platform\"" >> "$dir/REMOTE_STATE.yml"
-      echo "    ssh_url: \"${urls_ref[$platform]}\"" >> "$dir/REMOTE_STATE.yml"
-      echo "    last_sync_status: \"created\"" >> "$dir/REMOTE_STATE.yml"
-      echo "    last_synced: \"$(date -Iseconds)\"" >> "$dir/REMOTE_STATE.yml"
-    done
-    echo -e "${GREEN}✓ Simple manifest created (yq not available)${NC}"
+  # Keep the previous version inside the git dir (never committed) before an
+  # explicit rewrite. This is a convenience copy; git history remains the
+  # primary recovery path for a committed manifest.
+  if [[ -f "$target" ]]; then
+    local git_dir
+    git_dir=$(git -C "$dir" rev-parse --git-dir 2>/dev/null || true)
+    if [[ -n "$git_dir" ]]; then
+      [[ "$git_dir" == /* ]] || git_dir="$dir/$git_dir"
+      mkdir -p "$git_dir/repo-crafter" 2>/dev/null || true
+      cp -p "$target" "$git_dir/repo-crafter/repo-crafter.yml.bak" 2>/dev/null || true
+    fi
+  fi
+
+  chmod 0644 "$tmp" 2>/dev/null || true
+  if ! mv -f "$tmp" "$target"; then
+    rm -f "$tmp"
+    echo -e "${RED}❌ Could not replace $target; original left untouched.${NC}" >&2
+    return 1
+  fi
+  return 0
+}
+
+create_manifest() {
+  local dir="$1"
+  local action_type="${2:-create}"
+  local primary_url="${3:-}"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    DRY_RUN_ACTIONS+=("Create manifest at $dir/repo-crafter.yml (schema 1)")
     return 0
   fi
 
-  # Create full manifest with yq
-  {
-    # Header comments
-    echo "# ------------------------------------------------------------------"
-    echo "# REPO-CRAFTER REMOTE STATE MANIFEST"
-    echo "# Generated: $(date)"
-    echo "# Project: $name"
-    echo "# Action: $action_type"
-    echo "# ------------------------------------------------------------------"
-    echo ""
-  } > "$dir/REMOTE_STATE.yml"
+  if ! git -C "$dir" rev-parse --git-dir &>/dev/null; then
+    echo -e "${RED}❌ Cannot create a manifest: '$dir' is not a git repository.${NC}" >&2
+    return 1
+  fi
 
-  local timestamp
-  timestamp=$(date -Iseconds)
+  # Build the remote list from the actual git remotes, never from platform
+  # detection. This keeps manifest names identical to `git remote` names even
+  # when a rename failed or a collision suffix was used.
+  local -a remote_names=() remote_urls=()
+  local rname rurl seen=""
+  local remote
+  while IFS= read -r remote; do
+    [[ -z "$remote" ]] && continue
+    rname="$remote"
+    case " $seen " in *" $rname "*) continue ;; esac
+    seen+=" $rname"
+    # Read the URL via config, not by parsing `git remote -v` lines. That keeps
+    # embedded newlines/spaces in the URL intact instead of awk splitting them
+    # into fake remotes (e.g. name/injected:, url/"yes").
+    rurl=$(git -C "$dir" config "remote.${rname}.url" 2>/dev/null || true)
+    [[ -z "$rurl" ]] && continue
+    case "$rurl" in
+      *[$'\n\r\t\e\f\v']*)
+        echo -e "${RED}❌ Cannot create a manifest: remote '$rname' URL contains control characters.${NC}" >&2
+        echo -e "${YELLOW}   Remove the offending remote and retry.${NC}" >&2
+        return 1
+        ;;
+    esac
+    remote_names+=("$rname")
+    remote_urls+=("$rurl")
+  done < <(git -C "$dir" remote 2>/dev/null)
 
-  # Add machine-readable YAML section using yq with shell variable expansion
-  yq e -n '.metadata = {}' -i "$dir/REMOTE_STATE.yml"
-  yq e '.metadata.manifest_version = "1.0"' -i "$dir/REMOTE_STATE.yml"
-  yq e ".metadata.created = \"$timestamp\"" -i "$dir/REMOTE_STATE.yml"
-  yq e ".metadata.last_updated = \"$timestamp\"" -i "$dir/REMOTE_STATE.yml"
-  yq e ".metadata.project_name = \"$name\"" -i "$dir/REMOTE_STATE.yml"
-  yq e ".metadata.maintainer = \"$user_name\"" -i "$dir/REMOTE_STATE.yml"
-  yq e ".metadata.last_action = \"$action_type\"" -i "$dir/REMOTE_STATE.yml"
-  yq e ".metadata.last_action_timestamp = \"$timestamp\"" -i "$dir/REMOTE_STATE.yml"
+  if [[ ${#remote_names[@]} -eq 0 ]]; then
+    echo -e "${RED}❌ Cannot create a manifest: no git remotes found.${NC}" >&2
+    return 1
+  fi
 
-  yq e -n '.local_state = {}' -i "$dir/REMOTE_STATE.yml"
-  yq e ".local_state.primary_branch = \"$branch\"" -i "$dir/REMOTE_STATE.yml"
-  yq e ".local_state.head_commit = \"$commit_hash\"" -i "$dir/REMOTE_STATE.yml"
-  yq e ".local_state.project_path = \"$dir\"" -i "$dir/REMOTE_STATE.yml"
+  local project_name default_branch primary_name=""
+  local now
+  project_name=$(basename "$dir")
+  default_branch=$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || echo "main")
+  now=$(date +"%Y-%m-%dT%H:%M:%S%z")
 
-  yq e -n '.platforms = {}' -i "$dir/REMOTE_STATE.yml"
+  # The primary remote is the one whose URL is the project's original/current
+  # remote; otherwise the first remote git reports.
+  local i
+  if [[ -n "$primary_url" ]]; then
+    for i in "${!remote_urls[@]}"; do
+      if [[ "${remote_urls[$i]}" == "$primary_url" ]]; then
+        # Prefer origin when several remotes share the same URL.
+        if [[ -z "$primary_name" || "${remote_names[$i]}" == "origin" ]]; then
+          primary_name="${remote_names[$i]}"
+        fi
+        [[ "$primary_name" == "origin" ]] && break
+      fi
+    done
+  fi
+  if [[ -z "$primary_name" ]]; then
+    if [[ " ${remote_names[*]} " == *" origin "* ]]; then
+      primary_name="origin"
+    else
+      primary_name="${remote_names[0]}"
+    fi
+  fi
 
-  # Add each platform's details
-  for platform in "${!urls_ref[@]}"; do
-    local ssh_url="${urls_ref[$platform]}"
-    local repo_check_endpoint="${PLATFORM_REPO_CHECK_ENDPOINT[$platform]:-}"
-    local repo_create_endpoint="${PLATFORM_REPO_CREATE_ENDPOINT[$platform]:-}"
+  local content=""
+  content+="# repo-crafter manifest"$'\n'
+  content+="# Declares intent. repo-crafter reads this file; edit it deliberately."$'\n'
+  content+="# Generated: ${now}"$'\n'
+  content+="# Action: ${action_type}"$'\n'
+  content+=""$'\n'
+  content+="schema: 1"$'\n'
+  content+=""$'\n'
+  content+="project:"$'\n'
+  content+="  name: $(_yaml_quote "$project_name")"$'\n'
+  content+="  default_branch: $(_yaml_quote "$default_branch")"$'\n'
+  content+=""$'\n'
+  content+="remotes:"$'\n'
 
-    # Create platform entry with direct variable expansion
-    yq e -n ".platforms.$platform = {}" -i "$dir/REMOTE_STATE.yml"
-    yq e ".platforms.$platform.remote_name = \"$platform\"" -i "$dir/REMOTE_STATE.yml"
-    yq e ".platforms.$platform.ssh_url = \"$ssh_url\"" -i "$dir/REMOTE_STATE.yml"
-    yq e -n ".platforms.$platform.api_config_snapshot = {}" -i "$dir/REMOTE_STATE.yml"
-    yq e ".platforms.$platform.api_config_snapshot.repo_check_endpoint = \"$repo_check_endpoint\"" -i "$dir/REMOTE_STATE.yml"
-    yq e ".platforms.$platform.api_config_snapshot.repo_create_endpoint = \"$repo_create_endpoint\"" -i "$dir/REMOTE_STATE.yml"
-    yq e -n ".platforms.$platform.branch_mapping = {}" -i "$dir/REMOTE_STATE.yml"
-    yq e ".platforms.$platform.branch_mapping.\"$branch\" = \"$commit_hash\"" -i "$dir/REMOTE_STATE.yml"
-    yq e ".platforms.$platform.last_sync_status = \"created\"" -i "$dir/REMOTE_STATE.yml"
-    yq e ".platforms.$platform.last_synced = \"$timestamp\"" -i "$dir/REMOTE_STATE.yml"
+  local host owner repo path platform role display_url redacted_any=false
+  for i in "${!remote_names[@]}"; do
+    rname="${remote_names[$i]}"
+    rurl="${remote_urls[$i]}"
+
+    host=$(_url_host "$rurl" 2>/dev/null || true)
+    path=$(parse_git_url "$rurl")
+    repo="${path##*/}"
+    owner="${path%/*}"
+    [[ "$owner" == "$path" ]] && owner=""
+    platform=$(detect_platform_from_url "$rurl" 2>/dev/null || true)
+    [[ -z "$platform" ]] && platform="unknown"
+    if [[ "$rname" == "$primary_name" ]]; then role="primary"; else role="mirror"; fi
+
+    # Never commit credentials: the manifest records the canonical URL only.
+    display_url=$(_redact_url_credentials "$rurl")
+    [[ "$display_url" != "$rurl" ]] && redacted_any=true
+
+    content+="  - name: $(_yaml_quote "$rname")"$'\n'
+    content+="    platform: $(_yaml_quote "$platform")"$'\n'
+    [[ -n "$host" ]] && content+="    host: $(_yaml_quote "$host")"$'\n'
+    [[ -n "$owner" ]] && content+="    owner: $(_yaml_quote "$owner")"$'\n'
+    content+="    repo: $(_yaml_quote "$repo")"$'\n'
+    content+="    role: $(_yaml_quote "$role")"$'\n'
+    content+="    url: $(_yaml_quote "$display_url")"$'\n'
   done
 
-  echo -e "${GREEN}✓ Full manifest created${NC}"
+  if [[ "$redacted_any" == "true" ]]; then
+    echo -e "${YELLOW}⚠️  Credentials embedded in a remote URL were removed from the manifest.${NC}" >&2
+    echo -e "${YELLOW}   Keep tokens out of committed files; use SSH or a credential helper.${NC}" >&2
+  fi
+
+  if ! _manifest_write_atomic "$dir/repo-crafter.yml" "$content"; then
+    return 1
+  fi
+
+  echo -e "${GREEN}✓ Manifest written: $dir/repo-crafter.yml${NC}"
+  echo -e "${YELLOW}  Commit it so the declared intent travels with the project.${NC}"
+  return 0
+}
+
+# Strip one layer of YAML quoting and surrounding whitespace.
+_manifest_unquote() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  # A trailing comment is allowed on unquoted scalars.
+  if [[ "$value" != \"* && "$value" != \'* ]]; then
+    value="${value%%[[:space:]]#*}"
+    value="${value%"${value##*[![:space:]]}"}"
+  fi
+  if [[ ${#value} -ge 2 && "$value" == \"*\" ]]; then
+    value="${value:1:${#value}-2}"
+    value="${value//\\\"/\"}"
+    value="${value//\\\\/\\}"
+  elif [[ ${#value} -ge 2 && "$value" == \'*\' ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s' "$value"
+}
+
+# Read the documented block-YAML subset without requiring yq. The reader is
+# indentation-tolerant inside project/remotes and ignores comments and blanks.
+_manifest_read_awk() {
+  local file="$1"
+  local line key value section="" have_remote=0
+  local r_name="" r_platform="" r_host="" r_owner="" r_repo="" r_role="" r_url=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+
+    if [[ "$line" =~ ^([a-zA-Z_][a-zA-Z0-9_]*):[[:space:]]*(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      value="${BASH_REMATCH[2]}"
+      case "$key" in
+        schema)
+          printf 'SCHEMA\x1f%s\n' "$(_manifest_unquote "$value")"
+          section=""
+          ;;
+        project) section="project" ;;
+        remotes) section="remotes" ;;
+        *) section="" ;;
+      esac
+      continue
+    fi
+
+    if [[ "$section" == "project" && "$line" =~ ^[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*):[[:space:]]*(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      value=$(_manifest_unquote "${BASH_REMATCH[2]}")
+      printf 'PROJECT\x1f%s\x1f%s\n' "$key" "$value"
+      continue
+    fi
+
+    if [[ "$section" == "remotes" ]]; then
+      if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*name:[[:space:]]*(.*)$ ]]; then
+        if [[ "$have_remote" == "1" ]]; then
+          printf 'REMOTE\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
+            "$r_name" "$r_platform" "$r_host" "$r_owner" "$r_repo" "$r_role" "$r_url"
+        fi
+        have_remote=1
+        r_name=$(_manifest_unquote "${BASH_REMATCH[1]}")
+        r_platform=""; r_host=""; r_owner=""; r_repo=""; r_role=""; r_url=""
+        continue
+      fi
+      if [[ "$have_remote" == "1" && "$line" =~ ^[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*):[[:space:]]*(.*)$ ]]; then
+        key="${BASH_REMATCH[1]}"
+        value=$(_manifest_unquote "${BASH_REMATCH[2]}")
+        case "$key" in
+          platform) r_platform="$value" ;;
+          host) r_host="$value" ;;
+          owner) r_owner="$value" ;;
+          repo) r_repo="$value" ;;
+          role) r_role="$value" ;;
+          url) r_url="$value" ;;
+        esac
+        continue
+      fi
+    fi
+  done < "$file"
+
+  if [[ "$have_remote" == "1" ]]; then
+    printf 'REMOTE\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
+      "$r_name" "$r_platform" "$r_host" "$r_owner" "$r_repo" "$r_role" "$r_url"
+  fi
+}
+
+# yq handles full YAML; jq turns it into the same line format as the awk reader.
+_manifest_read_yq() {
+  local file="$1"
+  yq e -o=json '.' "$file" 2>/dev/null | jq -r '
+    (
+      "SCHEMA\u001f\((.schema // "") | tostring)",
+      "PROJECT\u001fname\u001f\((.project.name // "") | tostring)",
+      "PROJECT\u001fdefault_branch\u001f\((.project.default_branch // "") | tostring)",
+      ((.remotes // [])[] |
+        "REMOTE\u001f\((.name // "") | tostring)\u001f\((.platform // "") | tostring)\u001f\((.host // "") | tostring)\u001f\((.owner // "") | tostring)\u001f\((.repo // "") | tostring)\u001f\((.role // "") | tostring)\u001f\((.url // "") | tostring)")
+    )
+  '
+}
+
+# Emit normalized lines: SCHEMA<TAB>value, PROJECT<TAB>key<TAB>value,
+# REMOTE<TAB>name<TAB>platform<TAB>host<TAB>owner<TAB>repo<TAB>role<TAB>url.
+# Returns 2 when the manifest is absent, 1 when it cannot be parsed.
+_manifest_read() {
+  local dir="$1"
+  local file="$dir/repo-crafter.yml"
+  [[ -f "$file" ]] || return 2
+
+  if command -v yq &>/dev/null; then
+    _manifest_read_yq "$file"
+  else
+    _manifest_read_awk "$file"
+  fi
+}
+
+# Validate the declared intent. Never writes. Returns 0 valid, 1 invalid,
+# 2 absent.
+manifest_validate() {
+  local dir="$1"
+  local file="$dir/repo-crafter.yml"
+  local output line kind a b c d e f g
+  local schema="" project_name="" default_branch=""
+  local remote_count=0 primary_count=0 errors=0 warnings=0
+  local -A seen_names=()
+
+  if [[ ! -f "$file" ]]; then
+    echo -e "${YELLOW}No manifest found: $file${NC}"
+    return 2
+  fi
+
+  if ! output=$(_manifest_read "$dir"); then
+    echo -e "${RED}❌ Could not parse $file${NC}"
+    return 1
+  fi
+  [[ -n "$output" ]] || { echo -e "${RED}❌ Manifest is empty: $file${NC}"; return 1; }
+
+  while IFS=$'\x1f' read -r kind a b c d e f g; do
+    case "$kind" in
+      SCHEMA)
+        schema="$a"
+        ;;
+      PROJECT)
+        case "$a" in
+          name) project_name="$b" ;;
+          default_branch) default_branch="$b" ;;
+        esac
+        ;;
+      REMOTE)
+        remote_count=$((remote_count + 1))
+        local rname="$a" rrole="$f" rurl="$g"
+        if [[ -z "$rname" ]]; then
+          echo -e "${RED}❌ Remote entry #$remote_count has no name.${NC}"
+          errors=$((errors + 1))
+          continue
+        fi
+        if [[ -n "${seen_names[$rname]:-}" ]]; then
+          echo -e "${RED}❌ Duplicate remote name: '$rname'.${NC}"
+          errors=$((errors + 1))
+        fi
+        seen_names["$rname"]=1
+        if [[ -z "$rurl" && -z "$e" ]]; then
+          echo -e "${YELLOW}⚠️  Remote '$rname' has neither url nor repo; reconciliation will skip it.${NC}"
+          warnings=$((warnings + 1))
+        fi
+        if [[ "$rrole" == "primary" ]]; then
+          primary_count=$((primary_count + 1))
+        elif [[ -n "$rrole" && "$rrole" != "mirror" ]]; then
+          echo -e "${YELLOW}⚠️  Remote '$rname' has unknown role '$rrole'.${NC}"
+          warnings=$((warnings + 1))
+        fi
+        ;;
+    esac
+  done <<< "$output"
+
+  if [[ "$schema" != "1" ]]; then
+    echo -e "${RED}❌ Unsupported or missing schema: '${schema:-none}' (expected 1).${NC}"
+    errors=$((errors + 1))
+  fi
+  if [[ -z "$project_name" ]]; then
+    echo -e "${RED}❌ project.name is missing.${NC}"
+    errors=$((errors + 1))
+  fi
+  if [[ -z "$default_branch" ]]; then
+    echo -e "${YELLOW}⚠️  project.default_branch is missing.${NC}"
+    warnings=$((warnings + 1))
+  fi
+  if [[ $remote_count -eq 0 ]]; then
+    echo -e "${RED}❌ The manifest declares no remotes.${NC}"
+    errors=$((errors + 1))
+  fi
+  if [[ $remote_count -gt 0 && $primary_count -eq 0 ]]; then
+    echo -e "${YELLOW}⚠️  No remote is marked role: primary.${NC}"
+    warnings=$((warnings + 1))
+  elif [[ $primary_count -gt 1 ]]; then
+    echo -e "${YELLOW}⚠️  More than one remote is marked role: primary.${NC}"
+    warnings=$((warnings + 1))
+  fi
+
+  if [[ $errors -gt 0 ]]; then
+    echo -e "${RED}❌ Manifest invalid: $errors error(s), $warnings warning(s).${NC}"
+    return 1
+  fi
+  echo -e "${GREEN}✓ Manifest valid: $remote_count remote(s), $warnings warning(s).${NC}"
+  return 0
+}
+
+# Compare declared remotes with the actual git remotes. Read-only: reports
+# drift and returns 1, but never blocks the caller unless it chooses to.
+manifest_reconcile() {
+  local dir="$1"
+  local quiet="${2:-false}"
+  local file="$dir/repo-crafter.yml"
+  [[ -f "$file" ]] || return 0
+
+  if ! manifest_validate "$dir" >/dev/null 2>&1; then
+    echo -e "${YELLOW}⚠️  Manifest is invalid; not reconciling against git.${NC}"
+    return 1
+  fi
+
+  local -A declared=() declared_url=()
+  local output line kind a b c d e f g
+  output=$(_manifest_read "$dir") || return 1
+  while IFS=$'\x1f' read -r kind a b c d e f g; do
+    [[ "$kind" == "REMOTE" ]] || continue
+    declared["$a"]=1
+    # Compare canonical URLs so credentials in git never look like drift.
+    declared_url["$a"]=$(_redact_url_credentials "$g")
+  done <<< "$output"
+
+  local -A actual=() actual_url=()
+  local rname rurl
+  while IFS=$'\t' read -r rname rurl; do
+    [[ -z "$rname" ]] && continue
+    actual["$rname"]=1
+    actual_url["$rname"]=$(_redact_url_credentials "$rurl")
+  done < <(git -C "$dir" remote -v 2>/dev/null | awk '$3 == "(fetch)" { print $1 "\t" $2 }')
+
+  local drift=0 alt
+  for rname in "${!declared[@]}"; do
+    if [[ -z "${actual[$rname]:-}" ]]; then
+      alt=""
+      for a in "${!actual_url[@]}"; do
+        if [[ -n "${declared_url[$rname]}" && "${actual_url[$a]}" == "${declared_url[$rname]}" ]]; then
+          alt="$a"
+          break
+        fi
+      done
+      if [[ -n "$alt" ]]; then
+        echo -e "${YELLOW}⚠️  Manifest remote '$rname' is named '$alt' in git (same URL).${NC}"
+      else
+        echo -e "${YELLOW}⚠️  Manifest remote '$rname' is missing from git.${NC}"
+      fi
+      drift=1
+    elif [[ -n "${declared_url[$rname]}" && "${actual_url[$rname]}" != "${declared_url[$rname]}" ]]; then
+      echo -e "${YELLOW}⚠️  Manifest remote '$rname' URL differs:${NC}"
+      echo -e "     manifest: ${declared_url[$rname]}"
+      echo -e "     git     : ${actual_url[$rname]}"
+      drift=1
+    fi
+  done
+
+  for rname in "${!actual[@]}"; do
+    if [[ -z "${declared[$rname]:-}" ]]; then
+      echo -e "${YELLOW}⚠️  Git remote '$rname' is not declared in the manifest.${NC}"
+      drift=1
+    fi
+  done
+
+  if [[ $drift -eq 0 ]]; then
+    [[ "$quiet" == "true" ]] || echo -e "${GREEN}✓ Manifest matches git remotes.${NC}"
+    return 0
+  fi
+  return 1
+}
+
+# Move a legacy REMOTE_STATE.yml into .git/repo-crafter/legacy, then build the
+# new manifest from git. The legacy file is restored if the new write fails.
+manifest_migrate_legacy() {
+  local dir="$1"
+  local legacy="$dir/REMOTE_STATE.yml"
+  local new="$dir/repo-crafter.yml"
+  local git_dir backup_dir
+
+  [[ -f "$legacy" ]] || return 0
+  if [[ -f "$new" ]]; then
+    echo -e "${YELLOW}Both repo-crafter.yml and legacy REMOTE_STATE.yml exist; leaving both untouched.${NC}"
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    DRY_RUN_ACTIONS+=("Migrate legacy manifest $legacy to $new")
+    return 0
+  fi
+
+  git_dir=$(git -C "$dir" rev-parse --git-dir 2>/dev/null) || {
+    echo -e "${RED}❌ Cannot migrate: '$dir' is not a git repository.${NC}" >&2
+    return 1
+  }
+  [[ "$git_dir" == /* ]] || git_dir="$dir/$git_dir"
+  backup_dir="$git_dir/repo-crafter/legacy"
+
+  mkdir -p "$backup_dir" || return 1
+  if ! mv "$legacy" "$backup_dir/REMOTE_STATE.yml"; then
+    echo -e "${RED}❌ Could not preserve the legacy manifest; migration aborted.${NC}" >&2
+    return 1
+  fi
+
+  if ! create_manifest "$dir" "migrate_legacy" ""; then
+    mv "$backup_dir/REMOTE_STATE.yml" "$legacy" 2>/dev/null || true
+    echo -e "${RED}❌ Migration failed; legacy manifest restored.${NC}" >&2
+    return 1
+  fi
+
+  echo -e "${GREEN}✓ Legacy manifest preserved at $backup_dir/REMOTE_STATE.yml${NC}"
+  return 0
+}
+
+# Interactive home for check / create / migrate.
+manifest_workflow() {
+  echo -e "\n${BLUE}=== PROJECT MANIFEST ===${NC}"
+
+  local project_dir
+  project_dir=$(_select_project_from_dir "$REMOTE_ROOT" "Projects available:") || return 0
+  [[ -z "$project_dir" ]] && return 0
+
+  local manifest="$project_dir/repo-crafter.yml"
+  local legacy="$project_dir/REMOTE_STATE.yml"
+
+  if [[ -f "$legacy" && ! -f "$manifest" ]]; then
+    if confirm_action "Migrate legacy REMOTE_STATE.yml to repo-crafter.yml?" "y"; then
+      manifest_migrate_legacy "$project_dir" || true
+    fi
+  fi
+
+  if [[ -f "$manifest" ]]; then
+    if manifest_validate "$project_dir"; then
+      manifest_reconcile "$project_dir" || true
+      if confirm_action "Rewrite repo-crafter.yml from the current git remotes?" "n"; then
+        create_manifest "$project_dir" "rewrite" "" || true
+      fi
+    else
+      echo -e "${YELLOW}Fix the manifest before rewriting it; the current file was left untouched.${NC}"
+    fi
+  else
+    if confirm_action "No manifest found. Create one from the current git remotes?" "y"; then
+      create_manifest "$project_dir" "init" "" || true
+    fi
+  fi
+
+  read -rp $'\n'"Press Enter to continue..." -n 1 || true
 }
 
 # Prompt for project name with validation
@@ -3069,7 +3718,6 @@ _select_project_from_dir() {
         for i in "${!projects[@]}"; do
             local project_name=$(basename "${projects[i]}")
             local project_path="${projects[i]}"
-            local size=$(du -sh "${projects[i]}" 2>/dev/null | cut -f1 || echo "0B")
             local git_info=""
 
             if [[ -d "${projects[i]}/.git" ]]; then
@@ -3084,11 +3732,11 @@ _select_project_from_dir() {
                 git_info="${RED}✗${NC} (no git)"
             fi
 
-            local display_path="${project_path#$HOME/Projects/}"
+            local display_path="${project_path#$PROJECT_ROOT/}"
 
             echo -e "  ${BLUE}$((i+1)))${NC} ${GREEN}$project_name${NC}"
             echo -e "      Location: $display_path"
-            echo -e "      Size: $size | Git: $git_info"
+            echo -e "      Git: $git_info"
             echo ""
         done
     } >&2
@@ -3130,7 +3778,7 @@ show_about() {
     echo -e "${BLUE}║         ABOUT REPO-CRAFTER           ║${NC}"
     echo -e "${BLUE}╚══════════════════════════════════════╝${NC}"
     echo ""
-    echo "repo-crafter v1.0.0-beta beta - A safe, interactive shell script for managing Git repositories across multiple platforms."
+    echo "repo-crafter v${SCRIPT_VERSION} - A safe, interactive shell script for managing Git repositories across multiple platforms."
     echo "Copyright (C) 2026 Dharrun Singh .M"
     echo ""
     echo "This program is free software: you can redistribute it and/or modify"
@@ -3248,14 +3896,14 @@ main_menu() {
     while true; do
         clear
         echo -e "${BLUE}╔══════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║     / REPO-CRAFTER v1.1.1-beta \     ║${NC}"
+        echo -e "${BLUE}║     / REPO-CRAFTER v${SCRIPT_VERSION} \     ║${NC}"
         echo -e "${BLUE}║     | Generic Platform Edition |     ║${NC}"
         echo -e "${BLUE}╚══════════════════════════════════════╝${NC}"
         echo -e "${GREEN}Copyright (C) 2026 Dharrun Singh .M under GNU GPLV3+${NC}"
         echo -e "${YELLOW}Select About for more details${NC}"
         echo -e "${RED}⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️o⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️⚡️${NC}"
         echo -e "${YELLOW}┌ Platforms: ${GREEN}${AVAILABLE_PLATFORMS[*]}${NC}"
-        echo -e "${YELLOW}└ Root: ${GREEN}$HOME/Projects/${NC}"
+        echo -e "${YELLOW}└ Root: ${GREEN}$PROJECT_ROOT/${NC}"
 
         echo -e "\n${BLUE}🛠  CREATE NEW PROJECT${NC}"
         echo -e "\n${BLUE}📦 PROJECT MANAGEMENT${NC}"
@@ -3272,9 +3920,10 @@ main_menu() {
         echo -e "\n${BLUE}⚙️  SYSTEM${NC}"
         echo "  8) 🧪 Test Configuration"
         echo "  9) ℹ️ About this script"
+        echo " 10) 🧾 Project Manifest"
         echo "  0) 🚪 Exit"
         echo ""
-        read -rp "Select (0-9): " choice
+        read -rp "Select (0-10): " choice
 
         case $choice in
             1) run_menu_action create_new_project_workflow ;;
@@ -3286,6 +3935,7 @@ main_menu() {
             7) run_menu_action gitignore_maker_interactive ;;
             8) run_menu_action test_platform_config ;;
             9) run_menu_action show_about ;;
+           10) run_menu_action manifest_workflow ;;
             0) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
             *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
@@ -3301,7 +3951,7 @@ DEBUG_MODE=false  # Set to true to see API calls with half-masked tokens
 parse_args() {
     case "${1:-}" in
         --help|-h)
-            echo "repo-crafter v1.0.0-beta - Interactive Git Repository Manager"
+            echo "repo-crafter v${SCRIPT_VERSION} - Interactive Git Repository Manager"
             echo "Copyright (C) 2026 Dharrun Singh .M - GPL v3+"
             echo ""
             echo "Usage: $0 [OPTIONS]"
@@ -3322,7 +3972,7 @@ parse_args() {
             exit 0
             ;;
         --version)
-            echo "repo-crafter v1.1.1-beta - Generic Platform Edition"
+            echo "repo-crafter v${SCRIPT_VERSION} - Generic Platform Edition"
             echo "Copyright (C) 2026 Dharrun Singh .M"
             echo "License: GNU GPL v3+ (https://www.gnu.org/licenses/gpl-3.0.txt)"
             echo "This program comes with ABSOLUTELY NO WARRANTY."
@@ -3348,7 +3998,7 @@ parse_args "$@"
 # ======================= SCRIPT INITIALIZATION ===============================
 main() {
     # 1. Check for essential tools
-    local required_tools=(git curl jq ssh envsubst tr)
+    local required_tools=(git curl jq ssh tr)
     local optional_tools=(yq)
 
     echo -n "Checking required tools... "

@@ -333,8 +333,8 @@ If you see ✓ and ✅, your setup is correct.
 - Organized by platform name (e.g., `github.com/`, `gitlab.com/`)
 
 ### **Multi-Server Projects** (`~/Projects/Remote_Projects/Multi-server/`)
-- Pushed to multiple platforms simultaneously
-- Creates `REMOTE_STATE.yml` manifest with platform state
+- Bound to multiple platforms; each push is a deliberate manual command
+- Creates `repo-crafter.yml` manifest declaring the actual remotes
 - Perfect for mirroring to GitLab backup while using GitHub primary
 
 ---
@@ -366,7 +366,7 @@ repo-crafter
     3) Local-only: Move to `.git/info/exclude` (never pushed)
 7. Confirm preview prompts with `y`
 
-**Result**: New repository created, pushed, ready for development at `~/Projects/Remote_Projects/github.com/motor-controller/`
+**Result**: New repository created and ready at `~/Projects/Remote_Projects/github.com/motor-controller/`. Nothing was pushed; run the printed `git push -u <remote> <branch>` when you are ready.
 
 ### **Workflow 2: Clone an Existing Repository**
 
@@ -407,7 +407,7 @@ repo-crafter
 # Select: 2) 🔗 Convert Local → Remote
 # Choose: secret-sensor-design
 # Select binding method: Create new repositories
-# Add platform(s) and push
+# Add platform(s), then push manually when ready
 ```
 
 ### **Workflow 4:  Convert Single-Platform to Multi-Platform Project**
@@ -426,7 +426,7 @@ repo-crafter
 **Script performs:**
 - Moves project to `~/Projects/Remote_Projects/Multi-server/`
 - Adds new remotes for each platform URL
-- Creates `REMOTE_STATE.yml` manifest file
+- Creates `repo-crafter.yml` manifest declaring the actual remotes
 - Renames existing "origin" remote to platform name (e.g., "github")
 - Shows status of all configured remotes
 
@@ -434,7 +434,7 @@ repo-crafter
 - Your original single-platform remote is preserved with a new name
 - All existing commits and history are maintained
 - You can push to all platforms with `git push --all`
-- The manifest file tracks state for future operations
+- The manifest file declares intent for future operations; it is not a state cache
 
 **Example output:**
 
@@ -496,7 +496,7 @@ repo-crafter
 1. Select `3) 🔓 Convert Remote → Local`
 2. Choose project from list
 3. Confirm preview → Project moved to `Local_Projects/`, ALL remotes removed
-4. `REMOTE_STATE.yml` deleted if exists
+4. `repo-crafter.yml` (and any legacy `REMOTE_STATE.yml`) deleted
 
 **Result**: Keep all code locally, no remote sync, safe for personal backup
 
@@ -522,14 +522,16 @@ Perfect for: When you worked offline and the remote repository has new commits.
 Integration options:
   1) Rebase (clean history)
   2) Merge (safer for collaboration)
-  3) Skip - Push anyway (divergent branches)
+  3) Skip integration (no push)
   x) Cancel
 ```
 
 **Option details:**
-- **1) Rebase**: Places your local commits on top of remote commits (clean linear history). Best for personal projects.
-- **2) Merge**: Creates a merge commit that preserves both histories. Safest for team collaboration.
-- **3) Skip**: Creates intentionally divergent branches (advanced users only).
+- **1) Rebase**: Places your local commits on top of remote commits (clean linear history). Best for personal projects. The script then prints the `git push --force-with-lease` command; you run it.
+- **2) Merge**: Creates a merge commit that preserves both histories. Safest for team collaboration. The script then prints the `git push` command.
+- **3) Skip**: Leaves local and remote divergent and prints the manual `git pull --rebase` and `git push` commands.
+
+> **The script never pushes.** It fetches, reports, and can rebase or merge locally, but every remote write is a command you run deliberately.
 
 **Automatic handling:**
 - Uncommitted changes are automatically stashed before operations
@@ -690,70 +692,66 @@ repo-crafter --help
 ### **How It Works**
 1. During creation/binding, select multiple platforms (use `m` for multiple selection)
 2. Script creates repositories on **all** selected platforms
-3. Adds separate remotes for each platform (`git remote -v` shows `github`, `gitlab`)
-4. Generates `REMOTE_STATE.yml` manifest with all platform URLs and sync status
-5. Initial push goes to all platforms
-6. **Manual sync**: Use `git push github` or `git push gitlab` individually
+3. Adds separate remotes for each platform; the remote names are exactly what `git remote -v` shows
+4. Writes `repo-crafter.yml` from those actual remotes
+5. Initial push is manual per remote: `git push github`, `git push gitlab`
 
 ### **Project Structure**
 ```~/Projects/Remote_Projects/
 └── Multi-server/
     └── my-important-project/
         ├── .git/
-        ├── REMOTE_STATE.yml      # Manifest file
+        ├── repo-crafter.yml      # Declared intent (commit this)
         └── [project files]
 ```
 
-### **REMOTE_STATE.yml Manifest**
+### **repo-crafter.yml Manifest**
 
 ```yml
-# REPO-CRAFTER REMOTE STATE MANIFEST
-# Generated: 2026-01-12T15:30:45+00:00
-# Project: my-project
+# repo-crafter manifest
+# Declares intent. repo-crafter reads this file; edit it deliberately.
+# Generated: 2026-11-09T11:00:00+0530
 # Action: convert_single_to_multi
-# ------------------------------------------------------------------
 
-metadata:
-  manifest_version: "1.0"
-  created: "2026-01-12T15:30:45+00:00"
-  last_updated: "2026-01-12T15:30:45+00:00"
-  project_name: "my-project"
-  maintainer: "yourusername"
-  last_action: "convert_single_to_multi"
-  last_action_timestamp: "2026-01-12T15:30:45+00:00"
-local_state:
-  primary_branch: "main"
-  head_commit: "a1b2c3d"
-  project_path: "/home/user/Projects/Remote_Projects/Multi-server/my-project"
-platforms:
-  github:
-    remote_name: "github"
-    ssh_url: "git@github.com:yourusername/my-project.git"
-    api_config_snapshot:
-      repo_check_endpoint: "/repos/{owner}/{repo}"
-      repo_create_endpoint: "/user/repos"
-    branch_mapping:
-      main: "a1b2c3d"
-    last_sync_status: "created"
-    last_synced: "2026-01-12T15:30:45+00:00"
-  gitlab:
-    remote_name: "gitlab"
-    ssh_url: "git@gitlab.com:yourusername/my-project.git"
-    api_config_snapshot:
-      repo_check_endpoint: "/projects/{owner}%2F{repo}"
-      repo_create_endpoint: "/projects"
-    branch_mapping:
-      main: "a1b2c3d"
-    last_sync_status: "created"
-    last_synced: "2026-01-12T15:30:45+00:00"
+schema: 1
+
+project:
+  name: "my-important-project"
+  default_branch: "main"
+
+remotes:
+  - name: "github"
+    platform: "github"
+    host: "github.com"
+    owner: "yourusername"
+    repo: "my-important-project"
+    role: "primary"
+    url: "git@github.com:yourusername/my-important-project.git"
+  - name: "gitlab"
+    platform: "gitlab"
+    host: "gitlab.com"
+    owner: "yourusername"
+    repo: "my-important-project"
+    role: "mirror"
+    url: "git@gitlab.com:yourusername/my-important-project.git"
 ```
 
-**⚠️ WARNING**: 
-> **Important**: This file is automatically generated and should not be edited manually. The manifest tracks:
-> - Platform URLs and API configuration
-> - Branch commit mappings
-> - Last synchronization status and timestamps
-> - Project metadata for state restoration
+**What belongs here:** intent only — the project name, default branch, and the remotes that should exist, including their real git names, platforms, hosts, owners, repositories, roles, and URLs.
+
+**What never belongs here:** head commits, timestamps, absolute paths, maintainer usernames, ahead/behind counts, or API endpoint snapshots. Those are observations; the tool derives them from git when needed.
+
+**Ownership and recovery:**
+- `repo-crafter.yml` is human-owned and meant to be committed. The tool writes it only on create, convert, init, migrate, or an explicit rewrite.
+- Writes are atomic: a temporary file is written and validated, then moved over the original. A failed write leaves the original untouched.
+- Before an explicit rewrite, the previous version is copied to `.git/repo-crafter/repo-crafter.yml.bak` (never committed).
+- An invalid manifest is reported and left as-is; restore a good copy with `git checkout -- repo-crafter.yml` or the `.bak` copy.
+- A legacy `REMOTE_STATE.yml` is moved to `.git/repo-crafter/legacy/REMOTE_STATE.yml` during migration, never deleted.
+- Single-platform projects also receive a manifest with one remote, so every bound project has the same shape.
+- If a cloned repository already contains a manifest, it is validated and kept, not overwritten.
+
+**Checking a manifest:** menu option `10) 🧾 Project Manifest` selects a project, validates the schema, compares the declared remotes with `git remote -v`, and warns about missing, extra, renamed, or URL-mismatched remotes. It can also create a missing manifest or migrate a legacy one.
+
+**Optional keys:** later versions may use `branches`, `policy`, `ownership`, and `credentials` (references only, never secret values). The current reader uses `project` and `remotes` and ignores unknown keys. An explicit rewrite regenerates the file, so commit before rewriting if you have custom keys.
 
 
 ---
@@ -868,7 +866,7 @@ which repo-crafter
 - **Use `--test`** after modifying `platforms.conf` or tokens
 - **Never share tokens**; keep them in environment variables only
 - **For critical work**: Maintain separate backup on different platform
-- **Review manifests**: Check `REMOTE_STATE.yml` before deleting multi-platform projects
+- **Review manifests**: Check `repo-crafter.yml` before deleting multi-platform projects
 
 ### **SSH & API Safety**
 - SSH keys never leave your machine
@@ -976,7 +974,7 @@ repo_delete_endpoint = /projects/{owner}%2F{repo}
 4. **Multi-platform early**: If you might mirror later, create as multi-server from start
 5. **Clean up regularly**: Use `--dry-run` before deletion workflows
 6. **Test after changes**: Run `--test` after updating tokens or SSH keys
-7. **Review manifests**: Check `REMOTE_STATE.yml` in multi-platform projects before moving/deleting
+7. **Review manifests**: Check `repo-crafter.yml` in multi-platform projects before moving/deleting
 8. **Document decisions**: Use Mode 2 (cautious) gitignore to add comments explaining patterns
 
 ---
@@ -990,14 +988,14 @@ repo_delete_endpoint = /projects/{owner}%2F{repo}
 | `~/.ssh/id_ed25519_gitlab` | SSH private key | ✅ **CRITICAL** | ✅ **YES** |
 | `~/.bashrc` or `~/.zshrc` | Token environment variables | ✅ Yes | ✅ **YES** |
 | `~/Projects/` | All your projects | ✅ **CRITICAL** | Maybe (code) |
-| `REMOTE_STATE.yml` | Multi-platform manifest | ✅ Yes | No (URLs only) |
+| `repo-crafter.yml` | Declared project intent | ✅ Yes | No (URLs only) |
 
 **Security Checklist**:
 - [ ] SSH keys have `chmod 600` permissions
 - [ ] Tokens are in environment variables, not in config files
 - [ ] `platforms.conf` is not shared publicly
 - [ ] `.git/info/exclude` (Mode 3) is never committed
-- [ ] `REMOTE_STATE.yml` can be committed safely (no secrets)
+- [ ] `repo-crafter.yml` can be committed safely (no secrets)
 
 ---
 

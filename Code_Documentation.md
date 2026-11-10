@@ -364,16 +364,18 @@ current_branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
 - A different remote default is reported as a notice, never used to rename
 
 **Synchronization states (current branch only):**
-- **Missing on remote**: offer `git push -u "$platform" "$current_branch"`
-- **Identical branches** (`ahead=0` and `behind=0`): Offer push confirmation
-- **Local ahead only** (`behind=0` and `ahead>0`): Simple push workflow
-- **Remote ahead** (`behind>0`): Four options:
-  1. Rebase: `git rebase "$platform/$remote_branch" --quiet`
-  2. Merge: `git merge "$platform/$remote_branch" --no-edit --quiet`
-  3. Skip: Push anyway, creating divergent branches
+- **Missing on remote**: prints `git push -u "$platform" "$current_branch"`; never runs it
+- **Identical branches** (`ahead=0` and `behind=0`): reports nothing to push
+- **Local ahead only** (`behind=0` and `ahead>0`): prints the exact push command
+- **Remote ahead** (`behind>0`): four options:
+  1. Rebase: `git rebase "$platform/$remote_branch" --quiet`, then prints `git push --force-with-lease`
+  2. Merge: `git merge "$platform/$remote_branch" --no-edit --quiet`, then prints `git push -u`
+  3. Skip integration: prints manual `git pull --rebase` and `git push`
   4. Cancel: restore the stash and return non-zero
-- **Other local-only branches**: optional bulk push, excluding the current branch
+- **Other local-only branches**: listed with one `git push -u` command per branch
 - **Remote-only branches**: listed with a `git switch -c` suggestion; never merged automatically
+
+**Push policy:** the script never executes `git push`, `git push --force`, or any remote write. It fetches, reports ahead/behind, and performs local rebase/merge only. Every push is a deliberate user action.
 
 **Stash management:**
 - Pre-synchronization: `git stash push -m "repo-crafter: pre-sync" --quiet`
@@ -464,9 +466,11 @@ behind=$(git rev-list --count "$current_branch..$platform/$remote_branch" 2>/dev
 **Decision matrix:**
 | Local Ahead | Remote Behind | Action |
 |-------------|--------------|--------|
-| 0 | 0 | Push option |
-| >0 | 0 | Simple push |
-| Any | >0 | Integration options (rebase/merge/push-anyway/cancel) |
+| 0 | 0 | Report identical; nothing to push |
+| >0 | 0 | Print the push command |
+| Any | >0 | Integration options (rebase/merge/skip/cancel); push is always printed, never run |
+
+**Remote writes:** none. The script is read-only toward remotes: `git fetch`, `git ls-remote`, and API reads. Local `git rebase`/`git merge` are the only history changes.
 
 **Stash management protocol:**
 ```bash
@@ -527,13 +531,15 @@ parse_git_url() {
   # Protocol stripping
   url="${url#*://}"
   url="${url#*@}"
-  
-  # SSH format handling
-  url="${url#*:}"
-  
-  # Path extraction
-  url="${url#*/}"
-  
+
+  # SSH form: keep owner/repo after the colon
+  if [[ "$url" =~ ^[^/@]+@[^:/]+:(.+) ]]; then
+    url="${BASH_REMATCH[1]}"
+  else
+    # Protocol form: drop the host
+    url="${url#*/}"
+  fi
+
   # Sanitization
   url="${url%.git}"
   url="${url#/}"
@@ -547,43 +553,33 @@ echo "$dest_dir"  # ONLY directory path via stdout
 # All status messages go to stderr via >&2
 ```
 
-#### **9.5 `create_multi_platform_manifest(dir, name, urls_ref)`**
-State persistence mechanism for multi-platform projects.
+**Dry-run:** when `DRY_RUN=true`, the destination is computed and returned, the action is recorded, and no SSH check, network call, or `git clone` happens. Callers stop before changing directory.
 
-**YAML generation flow:**
+#### **9.5 `create_manifest(dir, action_type, primary_url)`**
+Human-owned intent manifest.
+
+**Source of truth:** `git remote -v` after all renames and additions, never platform detection. The `name` field is therefore identical to the real remote, including `origin` or a collision suffix such as `github_2`.
+
+**Format:** `repo-crafter.yml`, schema 1, block YAML. It contains `project.name`, `project.default_branch`, and one `remotes[]` entry per actual remote (`name`, `platform`, `host`, `owner`, `repo`, `role`, `url`). It never contains hashes, timestamps, absolute paths, maintainer names, or API snapshots.
+
+**Write path:**
 ```bash
-# Machine-readable section
-yq -n --arg name "$name" ... '{
-  metadata: { ... },
-  local_state: { ... },
-  platforms: { ... }
-}' >> "$dir/REMOTE_STATE.yml"
-
-# Platform-specific data injection
-yq -i --arg platform "$platform" ... \
-'.platforms[$platform] = { ... }' "$dir/REMOTE_STATE.yml"
+# Build content in memory, then:
+tmp=$(mktemp "$dir/.repo-crafter.yml.XXXXXX")
+printf '%s\n' "$content" > "$tmp"
+yq e '.' "$tmp" >/dev/null 2>&1   # when yq is available
+chmod 0644 "$tmp"
+mv -f "$tmp" "$dir/repo-crafter.yml"
 ```
+On any failure the temporary file is removed and the original manifest is untouched. Before replacing an existing file, the previous version is copied to `.git/repo-crafter/repo-crafter.yml.bak` (never committed). `yq` is optional; the writer does not require it.
 
-**Graceful degradation:**
-```bash
-if ! command -v yq &>/dev/null; then
-  # Fallback to simple manifest format
-  cat > "$dir/REMOTE_STATE.yml" << EOF
-# Simple manifest format
-platforms:
-  $platform:
-    remote_name: "$platform"
-    ssh_url: "${urls_ref[$platform]}"
-EOF
-fi
-```
+**Reader and checks:**
+- `_manifest_read` uses `yq` + `jq` when `yq` exists, otherwise a block-YAML subset parser.
+- `manifest_validate` checks schema, duplicate names, required fields, and the primary role.
+- `manifest_reconcile` compares declared remotes with `git remote -v` and reports missing, extra, renamed, or URL-mismatched remotes. It never writes.
+- `manifest_migrate_legacy` moves `REMOTE_STATE.yml` into `.git/repo-crafter/legacy/` and rebuilds the new manifest from git; if the new write fails, the legacy file is restored.
 
-**Critical data points:**
-- Branch mapping: `branch_mapping: { ($branch): $commit }`
-- API configuration snapshot for future operations
-- Last sync status and timestamp for state tracking
-
-**Note**: Manifest is only created for multi-platform projects (2+ platforms). Single-platform projects do not need a manifest as the git remote tracks the connection.
+**Note:** single-platform projects also receive a manifest with one remote. A project without one is legacy, not the normal state.
 
 
 ### **9.6 `convert_remote_to_local_workflow()`**
@@ -595,7 +591,7 @@ fi
 2. Show warning about removing ALL remotes
 3. **Status check**: Warns about uncommitted changes
 4. **Remove remotes**: Iterates `git remote` output, removes each
-5. **Delete manifest**: Removes `REMOTE_STATE.yml` if present
+5. **Delete manifest**: Removes `repo-crafter.yml` and any legacy `REMOTE_STATE.yml` if present
 6. **Move directory**: Executes `mv` to `LOCAL_ROOT`
 7. **Confirmation**: Shows success message
 
@@ -650,7 +646,7 @@ fi
 1. Select a project from `PROJECT_ROOT` (local-only and bound projects both listed)
 2. Warn based on state:
    - no remotes → this is the only copy, deletion is permanent
-   - has remotes → remotes stay, project can be re-cloned, `REMOTE_STATE.yml` goes with the folder
+   - has remotes → remotes stay, project can be re-cloned, `repo-crafter.yml` goes with the folder
 3. Confirm deletion
 4. `rm -rf` with `execute_dangerous` (skipped in dry-run)
 
@@ -687,7 +683,7 @@ Note: This function relies on _cleanup_failed_creation() for atomic operations d
    - Renames "origin" remote to platform name (if applicable)
    - Adds new remotes for additional URLs
    - Platform detection for remote naming
-7. **Manifest Generation**: Calls `create_multi_platform_manifest()` with "convert_single_to_multi" action type
+7. **Manifest Generation**: Calls `create_manifest()` after the renames/adds; entries are read from `git remote -v`
 **Directory Structure Transformation**:
 Before: REMOTE_ROOT/github.com/my-project/
 After:  REMOTE_ROOT/Multi-server/my-project/
@@ -933,28 +929,38 @@ preview_and_abort_if_dry  # Shows all accumulated actions and exits
 
 **UX**: Shows formatted list, prompts for selection or `x` to cancel.
 
-### **11.8 `create_multi_platform_manifest(dir, name, urls_ref, action_type)`**
+### **11.8 `create_manifest(dir, action_type, primary_url)`**
 
-**NEW: Generate machine-readable project state manifest**.
+**Generate the human-owned intent manifest**.
 
-**Purpose**: Tracks multi-platform project state for verification and sync operations.
+**Purpose**: Declare which remotes should exist, without mixing in volatile state. The tool reads it and reconciles it against git; it does not treat it as a cache.
 
-**Output**: `REMOTE_STATE.yml` with two sections:
+**Output**: `repo-crafter.yml`, schema 1:
 
-**Human-Readable Section**:
-- `project_name`, `description`, `created`, `maintainer`
-- `last_script_action`, `last_action_timestamp`
-- Commented platform URL quick-reference
+```yaml
+schema: 1
 
-**Machine-Readable Section**:
-- `platforms.{platform}.remote_name`
-- `platforms.{platform}.ssh_url`
-- `platforms.{platform}.api_config_snapshot`
-- `platforms.{platform}.branch_mapping`
-- `platforms.{platform}.last_sync_status`
-- `local_state.primary_branch`, `local_state.head_commit`
+project:
+  name: "my-project"
+  default_branch: "main"
 
-**Usage**: Enables future `verify_project_state()` and sync operations.
+remotes:
+  - name: "origin"
+    platform: "github"
+    host: "github.com"
+    owner: "yourusername"
+    repo: "my-project"
+    role: "primary"
+    url: "git@github.com:yourusername/my-project.git"
+```
+
+**Rules**:
+- Remote entries come from `git remote -v`, never from platform detection.
+- Exactly one remote is marked `role: primary`; the rest are `mirror`.
+- No commit hashes, timestamps, absolute paths, maintainer names, or API snapshots.
+- The write is atomic: temporary file, validation, `chmod 0644`, `mv -f`.
+- The reader (`_manifest_read`), validator (`manifest_validate`), reconciler (`manifest_reconcile`), and legacy migrator (`manifest_migrate_legacy`) never write to the manifest.
+- Menu option `10) 🧾 Project Manifest` exposes check, create, migrate, and explicit rewrite.
 
 
 ### **11.9 `confirm_action(message, default)`**
@@ -1005,14 +1011,13 @@ preview_and_abort_if_dry  # Shows all accumulated actions and exits
 - Copyright information
 - GPL v3+ license notice
 - Author contact information
-**Used by**: Menu option 8 (About this script)
+**Used by**: Menu option 9 (About this script)
  **12.2 Version Display**
-**Version string**:
-repo-crafter v1.0.0-beta - Generic Platform Edition
+**Version string**: one constant, `SCRIPT_VERSION` (currently `1.1.2-beta`).
 Displayed in: 
 - About section
 - Main menu header
-- Command line help output
+- `--help` and `--version` output
 ---
 
 
@@ -1057,7 +1062,7 @@ Displayed in:
 1. **Tool check**: Verifies `git`, `curl`, `jq`, `ssh` in PATH
 
 ``` bash
-required_tools=(git curl jq ssh envsubst tr)
+required_tools=(git curl jq ssh tr)
 optional_tools=(yq-go)
 for cmd in "${required_tools[@]}"; do
     if ! command -v "$cmd" &>/dev/null; then

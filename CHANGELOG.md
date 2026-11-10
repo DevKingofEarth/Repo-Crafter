@@ -53,17 +53,48 @@ All notable changes to Repo-Crafter will be documented in this file.
 - `is_safe_directory` now resolves the target and compares directory boundaries, so `/etcetera` is no longer rejected as `/etc`; `execute_dangerous` refuses `rm`/`mv` targets that resolve outside `PROJECT_ROOT` (including `..` escapes and the root itself)
 - `_create_with_new_remote` refuses an existing destination before creating anything, so it can no longer overwrite a `README.md` or let `_cleanup_failed_creation` delete a folder it did not create; it also runs `warn_duplicate_repo_name` before creating
 - `_create_local_only` runs `warn_duplicate_repo_name` before creating and returns non-zero when the destination already exists
-- `sync_with_remote` now syncs the current branch only and never renames branches; it offers to push a branch that is missing on the remote, lists local-only and remote-only branches, and does not merge or rebase branches that are not checked out
-- `sync_with_remote` treats a reachable but empty remote as accessible (the `ls-remote --exit-code` check failed for new repositories), and no longer offers to push the current branch a second time after it was just pushed
+- `sync_with_remote` now syncs the current branch only and never renames branches; it prints the push command for a branch that is missing on the remote, lists local-only and remote-only branches, and does not merge or rebase branches that are not checked out
+- `sync_with_remote` treats a reachable but empty remote as accessible (the `ls-remote --exit-code` check failed for new repositories), and no longer prints the push command twice for the current branch
 - `sync_with_remote` parses remote branches with `%(refname:lstrip=3)` and reads the remote default from the `ref:` line, so the remote name is no longer listed as a branch and the default is no longer `main\tHEAD`
 - `convert_local_to_remote_workflow` offers `sync_with_remote` after a successful bind: after connecting to an existing remote (`origin`) and after creating a single-platform remote; cancel or skip returns to the menu
 - README token instructions now point at the environment variables named by `token_var`, not at storing tokens in `platforms.conf`
 - `check_local_exists` now uses `git rev-parse --git-dir` (so worktrees and submodules count) and is called by the bind workflow, which reports "not a git repository yet" instead of the false "Uncommitted changes present"
 - The bind status block no longer claims "Local and remote are in sync" for a project with no remote or a branch with no upstream, and the ahead/behind comparison now matches git's tab-separated output (the old regex expected a space, so it never ran)
 - Removed the unused `preview_action` helper (superseded by `execute_dangerous` dry-run output)
+- `--dry-run` no longer clones in `_clone_existing_remote`; it reports the planned destination and returns without touching the network or filesystem
+- `--dry-run` in the bind workflow no longer runs `rsync`/`cpio` or reaches the commit step; option 1 plans the copy, option 2 plans the clone, and both stop with the "NO CHANGES WERE MADE" banner
+- `_bind_commit_changes` refuses to commit in dry-run
+- Dry-run no longer prints false success lines after skipped operations in unbind, single→multi conversion, and the delete workflows
 
-### Open (found, not fixed)
-- `convert_single_to_multi_platform` manifest keys follow platform detection, so when the `origin` rename fails the key can disagree with the actual remote name (manifest pass)
+### Added
+- Replaced the write-only `REMOTE_STATE.yml` with `repo-crafter.yml`, a human-owned intent manifest. Remote entries are built from `git remote -v`, so the declared `name` matches the real remote (`origin`, `github`, `github_2`, ...); this closes the open mapping item
+- Manifest writes are atomic: one temporary file, validation (yq when present), `chmod 0644`, then `mv -f`. The 23 sequential `yq -i` writes are gone, and the schema is identical with or without yq
+- Added `manifest_validate` (schema, duplicate names, required fields, primary role), `manifest_reconcile` (declared vs `git remote -v`: missing, extra, renamed, URL mismatch), and `manifest_migrate_legacy` (moves `REMOTE_STATE.yml` to `.git/repo-crafter/legacy/`, restores it if the new write fails)
+- Menu option `10) 🧾 Project Manifest` checks, creates, migrates, or explicitly rewrites a project's manifest; the reader and reconciler never write
+- Single-platform projects now receive a manifest with one remote, so bound projects have the same shape
+- `parse_git_url` now preserves the owner for SSH URLs (`git@host:owner/repo.git`), which the manifest needs; existing repo-name callers are unchanged
+- Unbind removes `repo-crafter.yml` and any legacy `REMOTE_STATE.yml`; `_delete_both` names both in its warning
+- Removed the open manifest-key item; no open items remain under `[fix/tier0]`
+
+### Changed
+- `sync_with_remote` no longer executes `git push` anywhere. It fetches, reports ahead/behind, performs local rebase/merge only, and prints the exact command to run. This covers the new branch, identical, ahead, post-rebase, post-merge, divergent-skip, and other-local-branches cases
+- After a rebase the printed command is `git push --force-with-lease`, with a warning that it rewrites the remote branch; after a merge it is a normal `git push -u`
+- The divergent "skip" option now means "skip integration" and prints manual `git pull --rebase` and `git push` commands instead of force-pushing
+- Push remains a deliberate user action, so a script run can no longer change a remote by accident
+- `_select_project_from_dir` compares branch sets with associative arrays instead of nested loops, so the inventory is linear in the number of branches
+- `warn_duplicate_remote_connections` uses `git -C` instead of `cd` in a subshell for every repository
+- The bind workflow's duplicated copy and commit blocks are now `_bind_copy_files` and `_bind_commit_changes`; both bind paths share one implementation
+- Version output now comes from one `SCRIPT_VERSION` constant (`1.1.2-beta`); the banner and project paths use `PROJECT_ROOT` instead of a hardcoded `$HOME/Projects`
+
+### Removed
+- `envsubst` from `required_tools`; it was declared but never used
+- The unused `continue_workflow` flag in the bind workflow
+- The per-project `du -sh` call in the project picker, which walked every tree just to show a size; the picker now shows only branch and remote state
+- `git clone`, `git ls-remote`, `git remote add`, and `git remote set-url` now receive `--` before every URL, so an option-looking value cannot be parsed as a flag
+- `_validate_git_url` rejects any value starting with `-` and only accepts `https://…`, `git@host:…`, or local filesystem paths; enforced at clone, `sync_with_remote`, `handle_existing_remote`, and the additional-remotes loop
+- `validate_project_name` rejects names starting with `-` or `.`, preventing leading-dash/leading-dot option injection
+- `select_platforms` validates menu input is numeric before any `$((…))` arithmetic, so malformed input no longer aborts the script under `set -e`
+- The unreachable `command -v curl` branch in `gitignore_maker`; `curl` is already a required tool
 
 ## [1.1.2-beta] - 2026-02-05
 
